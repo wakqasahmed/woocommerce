@@ -6,6 +6,7 @@
  */
 
 use Automattic\Jetpack\Constants;
+use Automattic\WooCommerce\Admin\API\Reports\Cache as ReportsCache;
 use Automattic\WooCommerce\Blocks\Options as BlockOptions;
 use Automattic\WooCommerce\Blocks\Utils\BlockTemplateUtils;
 use Automattic\WooCommerce\Internal\Features\FeaturesController;
@@ -467,5 +468,36 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 
 		$this->assertArrayHasKey( 'customer_stock_notifications', $changes );
 		$this->assertTrue( $changes['customer_stock_notifications'] );
+	}
+
+	/**
+	 * @testdox Migration registers and invalidates cached Analytics reports.
+	 */
+	public function test_wc_update_1120_invalidate_analytics_reports_cache(): void {
+		include_once WC_ABSPATH . 'includes/wc-update-functions.php';
+
+		$db_updates = WC_Install::get_db_update_callbacks();
+		$this->assertArrayHasKey( '11.2.0', $db_updates );
+		$this->assertContains( 'wc_update_1120_invalidate_analytics_reports_cache', $db_updates['11.2.0'] );
+
+		$cache_key        = 'wc_update_1120_analytics_report';
+		$version_key      = ReportsCache::VERSION_OPTION . '-transient-version';
+		$original_version = get_transient( $version_key );
+		set_transient( $version_key, 'stale-version' );
+
+		try {
+			ReportsCache::set( $cache_key, 'stale-value' );
+			$this->assertSame( 'stale-value', ReportsCache::get( $cache_key ) );
+
+			wc_update_1120_invalidate_analytics_reports_cache();
+			$this->assertFalse( ReportsCache::get( $cache_key ) );
+		} finally {
+			delete_transient( $cache_key );
+			if ( false === $original_version ) {
+				delete_transient( $version_key );
+			} else {
+				set_transient( $version_key, $original_version );
+			}
+		}
 	}
 }

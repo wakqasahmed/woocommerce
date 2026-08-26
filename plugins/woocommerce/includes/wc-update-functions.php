@@ -19,6 +19,7 @@
 defined( 'ABSPATH' ) || exit;
 
 use Automattic\Jetpack\Constants;
+use Automattic\WooCommerce\Admin\API\Reports\Cache as ReportsCache;
 use Automattic\WooCommerce\Admin\Notes\Note;
 use Automattic\WooCommerce\Admin\Notes\Notes;
 use Automattic\WooCommerce\Database\Migrations\MigrationHelper;
@@ -3702,4 +3703,15 @@ function wc_update_1120_migrate_stock_notifications_alpha_constant() {
 	}
 
 	update_option( StockNotifications::ENABLE_OPTION_NAME, 'yes', true );
+}
+
+/**
+ * Invalidate cached Analytics reports after changing customer aggregate semantics.
+ *
+ * @since 11.2.0
+ *
+ * @return void
+ */
+function wc_update_1120_invalidate_analytics_reports_cache(): void {
+	ReportsCache::invalidate();
 }
