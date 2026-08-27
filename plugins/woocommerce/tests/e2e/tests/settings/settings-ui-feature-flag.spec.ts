@@ -34,6 +34,43 @@ const getBaseURL = ( baseURL: string | undefined ): string => {
 	return baseURL;
 };
 
+const getPostedFormValue = (
+	postData: string | null,
+	name: string
+): string | null => {
+	if ( ! postData ) {
+		return null;
+	}
+
+	const urlEncodedMarker = `${ name }=`;
+	const urlEncodedIndex = postData.indexOf( urlEncodedMarker );
+	if ( urlEncodedIndex !== -1 ) {
+		const start = urlEncodedIndex + urlEncodedMarker.length;
+		const end = postData.indexOf( '&', start );
+		return decodeURIComponent(
+			end === -1 ? postData.slice( start ) : postData.slice( start, end )
+		);
+	}
+
+	const multipartName = `name="${ name }"`;
+	const nameIndex = postData.indexOf( multipartName );
+	if ( nameIndex === -1 ) {
+		return null;
+	}
+
+	const valueStart = postData.indexOf( '\r\n\r\n', nameIndex );
+	if ( valueStart === -1 ) {
+		return null;
+	}
+
+	const valueEnd = postData.indexOf( '\r\n', valueStart + 4 );
+	if ( valueEnd === -1 ) {
+		return null;
+	}
+
+	return postData.slice( valueStart + 4, valueEnd );
+};
+
 test.describe( 'Settings UI feature flag', { tag: [ tags.NOT_E2E ] }, () => {
 	test.use( { storageState: ADMIN_STATE_PATH } );
 
@@ -161,14 +198,35 @@ test.describe( 'Settings UI feature flag', { tag: [ tags.NOT_E2E ] }, () => {
 			'input[type="hidden"][name="woocommerce_notify_low_stock_amount"]'
 		);
 
+		const saveButton = page.getByRole( 'button', {
+			name: 'Save',
+			exact: true,
+		} );
+
 		await expect(
 			page.locator( '[data-wc-settings-ui="1"]' )
 		).toBeVisible();
 		await expect( preservedLowStock ).toHaveValue( '2' );
 		await expect( lowStockFormValue ).toHaveValue( '02' );
 		await editedHoldStock.fill( '61' );
+		await editedHoldStock.blur();
+		await expect( saveButton ).toBeEnabled();
 		await expect( lowStockFormValue ).toHaveValue( '02' );
-		await page.getByRole( 'button', { name: 'Save', exact: true } ).click();
+
+		const saveRequestPromise = page.waitForRequest( ( httpRequest ) => {
+			return (
+				httpRequest.method() === 'POST' &&
+				httpRequest.url().includes( 'page=wc-settings' )
+			);
+		} );
+		await saveButton.click();
+		const saveRequest = await saveRequestPromise;
+		expect(
+			getPostedFormValue(
+				saveRequest.postData(),
+				'woocommerce_notify_low_stock_amount'
+			)
+		).toBe( '02' );
 
 		await expect( page.locator( 'div.updated.inline' ) ).toContainText(
 			'Your settings have been saved.'

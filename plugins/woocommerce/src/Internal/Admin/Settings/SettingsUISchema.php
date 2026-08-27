@@ -1016,11 +1016,16 @@ class SettingsUISchema {
 		}
 
 		$value = trim( $value );
+		// Seconds occupy index 16 (`:ss`) for both local and qualified values.
+		$has_seconds = isset( $value[16] ) && ':' === $value[16];
+		$wall_format = $has_seconds ? 'Y-m-d\TH:i:s' : 'Y-m-d\TH:i';
+		$wall_time   = substr( $value, 0, $has_seconds ? 19 : 16 );
+
 		if ( preg_match( self::LOCAL_DATETIME_PATTERN, $value ) ) {
-			$format   = 16 === strlen( $value ) ? '!Y-m-d\TH:i' : '!Y-m-d\TH:i:s';
+			$format   = '!' . $wall_format;
 			$datetime = \DateTimeImmutable::createFromFormat( $format, $value, wp_timezone() );
 		} elseif ( preg_match( self::QUALIFIED_DATETIME_PATTERN, $value ) ) {
-			$format   = preg_match( '/T\d{2}:\d{2}:/', $value ) ? '!Y-m-d\TH:i:sP' : '!Y-m-d\TH:iP';
+			$format   = '!' . $wall_format . 'P';
 			$datetime = \DateTimeImmutable::createFromFormat( $format, $value );
 		} else {
 			throw self::invalid_schema( sprintf( 'Field "%s" datetime value is malformed.', $field_id ) );
@@ -1028,6 +1033,13 @@ class SettingsUISchema {
 
 		$errors = \DateTimeImmutable::getLastErrors();
 		if ( false === $datetime || ( is_array( $errors ) && ( 0 < $errors['warning_count'] || 0 < $errors['error_count'] ) ) ) {
+			throw self::invalid_schema( sprintf( 'Field "%s" datetime value is malformed.', $field_id ) );
+		}
+
+		// PHP can overflow a store-local DST gap (02:30 → 03:30) with no
+		// warning. Reject when wall time does not round-trip so the UI cannot
+		// display one instant while form-post still submits another.
+		if ( $datetime->format( $wall_format ) !== $wall_time ) {
 			throw self::invalid_schema( sprintf( 'Field "%s" datetime value is malformed.', $field_id ) );
 		}
 

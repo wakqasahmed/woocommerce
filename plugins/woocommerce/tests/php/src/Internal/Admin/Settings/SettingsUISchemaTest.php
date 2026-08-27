@@ -1708,45 +1708,59 @@ class SettingsUISchemaTest extends WC_Unit_Test_Case {
 	}
 
 	/**
-	 * @testdox It accepts PHP's warning-free DST gap shift and rejects malformed local dates.
+	 * @testdox It rejects store-local datetimes that PHP would shift across a DST gap.
+	 *
+	 * @dataProvider dst_gap_local_datetime_values
+	 *
+	 * @param string $value Store-local datetime in New York's spring-forward gap.
 	 */
-	public function test_canonicalize_schema_values_handles_dst_gap_and_invalid_dates(): void {
+	public function test_canonicalize_schema_values_rejects_dst_gap_local_datetime( string $value ): void {
 		$original_timezone = get_option( 'timezone_string' );
 		update_option( 'timezone_string', 'America/New_York' );
 
+		$caught = null;
 		try {
-			$schema = SettingsUISchema::canonicalize_schema_values(
-				$this->get_native_schema_with_field(
-					array(
-						'id'    => 'acme_start',
-						'label' => 'Starts',
-						'type'  => 'datetime-local',
-						'value' => '2026-03-08T02:30',
-						'save'  => array( 'adapter' => 'custom' ),
-					)
-				),
-				true
-			);
-
-			$this->assertSame( '2026-03-08T03:30:00-04:00', $schema['groups']['main']['fields'][0]['value'] );
-
-			$this->expectException( \InvalidArgumentException::class );
-			$this->expectExceptionMessage( 'datetime value is malformed' );
 			SettingsUISchema::canonicalize_schema_values(
 				$this->get_native_schema_with_field(
 					array(
 						'id'    => 'acme_start',
 						'label' => 'Starts',
 						'type'  => 'datetime-local',
-						'value' => '2026-02-30T12:00',
-						'save'  => array( 'adapter' => 'custom' ),
+						'value' => $value,
+						'save'  => array(
+							'adapter' => 'form_post',
+							'name'    => 'acme_start',
+						),
 					)
-				),
-				true
+				)
 			);
+		} catch ( \InvalidArgumentException $exception ) {
+			$caught = $exception;
 		} finally {
 			update_option( 'timezone_string', $original_timezone );
 		}
+
+		if ( ! $caught instanceof \InvalidArgumentException ) {
+			$this->fail( 'A DST-gap local datetime should fail closed instead of shifting the clock.' );
+		}
+
+		$this->assertStringContainsString(
+			'datetime value is malformed',
+			$caught->getMessage(),
+			'A DST-gap local datetime should fail closed instead of shifting the clock.'
+		);
+	}
+
+	/**
+	 * Store-local datetimes that fall in America/New_York's 2026 spring-forward gap.
+	 *
+	 * @return array<string, array{string}>
+	 */
+	public static function dst_gap_local_datetime_values(): array {
+		return array(
+			'without seconds' => array( '2026-03-08T02:30' ),
+			'with seconds'    => array( '2026-03-08T02:30:00' ),
+		);
 	}
 
 	/**
