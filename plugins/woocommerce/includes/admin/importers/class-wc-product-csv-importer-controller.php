@@ -32,6 +32,11 @@ class WC_Product_CSV_Importer_Controller {
 	private const IMPORT_CLEANUP_BATCH_SIZE = 30;
 
 	/**
+	 * AJAX position prefix used while importer placeholders are being removed.
+	 */
+	private const IMPORT_CLEANUP_POSITION_PREFIX = 'cleanup:';
+
+	/**
 	 * The path to the current file.
 	 *
 	 * @var string
@@ -322,16 +327,26 @@ class WC_Product_CSV_Importer_Controller {
 	}
 
 	/**
+	 * Get a post ID cutoff that freezes the cleanup candidate set.
+	 *
+	 * @return int Highest post ID present when cleanup starts.
+	 */
+	private static function get_import_cleanup_post_id_limit(): int {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The primary-key maximum must reflect posts created by the import that just finished.
+		return absint( $wpdb->get_var( "SELECT MAX(ID) FROM {$wpdb->posts}" ) );
+	}
+
+	/**
 	 * Remove one batch of temporary products and mapping data left by the importer.
 	 *
+	 * @param int $post_id_limit Highest post ID eligible for this cleanup run.
 	 * @throws RuntimeException When a placeholder cannot be deleted.
 	 * @return bool Whether all importer placeholders have been removed.
 	 */
-	private static function cleanup_after_import(): bool {
+	private static function cleanup_after_import( int $post_id_limit ): bool {
 		global $wpdb;
-
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- The importer requires one uncached cleanup of its temporary mapping markers.
-		$wpdb->delete( $wpdb->postmeta, array( 'meta_key' => '_original_id' ) );
 
 		$remaining_batch_size = self::IMPORT_CLEANUP_BATCH_SIZE;
 
@@ -341,9 +356,10 @@ class WC_Product_CSV_Importer_Controller {
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$post_ids = $wpdb->get_col(
 				$wpdb->prepare(
-					"SELECT ID FROM {$wpdb->posts} WHERE post_type = %s AND post_status = %s LIMIT %d",
+					"SELECT ID FROM {$wpdb->posts} WHERE post_type = %s AND post_status = %s AND ID <= %d LIMIT %d",
 					$post_type,
 					'importing',
+					$post_id_limit,
 					$remaining_batch_size + 1
 				)
 			);
@@ -365,6 +381,16 @@ class WC_Product_CSV_Importer_Controller {
 			}
 		}
 
+		// Remove mapping markers only after every frozen placeholder batch has completed.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- The importer requires one uncached cleanup of its temporary mapping markers.
+		$wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->postmeta} WHERE meta_key = %s AND post_id <= %d",
+				'_original_id',
+				$post_id_limit
+			)
+		);
+
 		return true;
 	}
 
@@ -377,12 +403,35 @@ class WC_Product_CSV_Importer_Controller {
 		check_ajax_referer( 'wc-product-import', 'security' );
 
 		try {
+			// PHPCS: input var ok.
+			$request_position = isset( $_POST['position'] ) ? wc_clean( wp_unslash( $_POST['position'] ) ) : 0;
+			$cleanup_pattern  = '/^' . preg_quote( self::IMPORT_CLEANUP_POSITION_PREFIX, '/' ) . '(\d+)$/';
+
+			if ( is_string( $request_position ) && preg_match( $cleanup_pattern, $request_position, $cleanup_matches ) ) {
+				$cleanup_complete = self::cleanup_after_import( absint( $cleanup_matches[1] ) );
+				$response         = array(
+					'position'            => $cleanup_complete ? 'done' : $request_position,
+					'percentage'          => 100,
+					'imported'            => 0,
+					'imported_variations' => 0,
+					'failed'              => 0,
+					'updated'             => 0,
+					'skipped'             => 0,
+				);
+
+				if ( $cleanup_complete ) {
+					$response['url'] = add_query_arg( array( '_wpnonce' => wp_create_nonce( 'woocommerce-csv-importer' ) ), admin_url( 'edit.php?post_type=product&page=product_importer&step=done' ) );
+				}
+
+				wp_send_json_success( $response );
+			}
+
 			$file = wc_clean( wp_unslash( $_POST['file'] ?? '' ) ); // PHPCS: input var ok.
 			self::validate_file_path( $file );
 
 			$params = array(
 				'delimiter'          => ! empty( $_POST['delimiter'] ) ? wc_clean( wp_unslash( $_POST['delimiter'] ) ) : ',', // PHPCS: input var ok.
-				'start_pos'          => isset( $_POST['position'] ) ? absint( $_POST['position'] ) : 0, // PHPCS: input var ok.
+				'start_pos'          => absint( $request_position ),
 				'mapping'            => isset( $_POST['mapping'] ) ? (array) wc_clean( wp_unslash( $_POST['mapping'] ) ) : array(), // PHPCS: input var ok.
 				'update_existing'    => isset( $_POST['update_existing'] ) ? (bool) $_POST['update_existing'] : false, // PHPCS: input var ok.
 				'character_encoding' => isset( $_POST['character_encoding'] ) ? wc_clean( wp_unslash( $_POST['character_encoding'] ) ) : '',
@@ -414,47 +463,28 @@ class WC_Product_CSV_Importer_Controller {
 
 			update_user_option( get_current_user_id(), 'product_import_error_log', $error_log );
 
-			if ( 100 === $percent_complete ) {
-				if ( ! self::cleanup_after_import() ) {
-					wp_send_json_success(
-						array(
-							'position'            => $importer->get_file_position(),
-							'percentage'          => 100,
-							'imported'            => is_countable( $results['imported'] ) ? count( $results['imported'] ) : 0,
-							'imported_variations' => is_countable( $results['imported_variations'] ) ? count( $results['imported_variations'] ) : 0,
-							'failed'              => is_countable( $results['failed'] ) ? count( $results['failed'] ) : 0,
-							'updated'             => is_countable( $results['updated'] ) ? count( $results['updated'] ) : 0,
-							'skipped'             => is_countable( $results['skipped'] ) ? count( $results['skipped'] ) : 0,
-						)
-					);
-				}
+			$response = array(
+				'position'            => $importer->get_file_position(),
+				'percentage'          => $percent_complete,
+				'imported'            => is_countable( $results['imported'] ) ? count( $results['imported'] ) : 0,
+				'imported_variations' => is_countable( $results['imported_variations'] ) ? count( $results['imported_variations'] ) : 0,
+				'failed'              => is_countable( $results['failed'] ) ? count( $results['failed'] ) : 0,
+				'updated'             => is_countable( $results['updated'] ) ? count( $results['updated'] ) : 0,
+				'skipped'             => is_countable( $results['skipped'] ) ? count( $results['skipped'] ) : 0,
+			);
 
-				// Send success.
-				wp_send_json_success(
-					array(
-						'position'            => 'done',
-						'percentage'          => 100,
-						'url'                 => add_query_arg( array( '_wpnonce' => wp_create_nonce( 'woocommerce-csv-importer' ) ), admin_url( 'edit.php?post_type=product&page=product_importer&step=done' ) ),
-						'imported'            => is_countable( $results['imported'] ) ? count( $results['imported'] ) : 0,
-						'imported_variations' => is_countable( $results['imported_variations'] ) ? count( $results['imported_variations'] ) : 0,
-						'failed'              => is_countable( $results['failed'] ) ? count( $results['failed'] ) : 0,
-						'updated'             => is_countable( $results['updated'] ) ? count( $results['updated'] ) : 0,
-						'skipped'             => is_countable( $results['skipped'] ) ? count( $results['skipped'] ) : 0,
-					)
-				);
-			} else {
-				wp_send_json_success(
-					array(
-						'position'            => $importer->get_file_position(),
-						'percentage'          => $percent_complete,
-						'imported'            => is_countable( $results['imported'] ) ? count( $results['imported'] ) : 0,
-						'imported_variations' => is_countable( $results['imported_variations'] ) ? count( $results['imported_variations'] ) : 0,
-						'failed'              => is_countable( $results['failed'] ) ? count( $results['failed'] ) : 0,
-						'updated'             => is_countable( $results['updated'] ) ? count( $results['updated'] ) : 0,
-						'skipped'             => is_countable( $results['skipped'] ) ? count( $results['skipped'] ) : 0,
-					)
-				);
+			if ( 100 === $percent_complete ) {
+				$post_id_limit = self::get_import_cleanup_post_id_limit();
+
+				if ( self::cleanup_after_import( $post_id_limit ) ) {
+					$response['position'] = 'done';
+					$response['url']      = add_query_arg( array( '_wpnonce' => wp_create_nonce( 'woocommerce-csv-importer' ) ), admin_url( 'edit.php?post_type=product&page=product_importer&step=done' ) );
+				} else {
+					$response['position'] = self::IMPORT_CLEANUP_POSITION_PREFIX . $post_id_limit;
+				}
 			}
+
+			wp_send_json_success( $response );
 		} catch ( \Exception $e ) {
 			wp_send_json_error( array( 'message' => $e->getMessage() ) );
 		}
@@ -586,6 +616,7 @@ class WC_Product_CSV_Importer_Controller {
 				'update_existing'    => $this->update_existing,
 				'delimiter'          => $this->delimiter,
 				'character_encoding' => $this->character_encoding,
+				'import_error'       => esc_html__( 'Import could not be completed.', 'woocommerce' ),
 			)
 		);
 		wp_enqueue_script( 'wc-product-import' );

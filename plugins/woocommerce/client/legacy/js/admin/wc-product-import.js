@@ -32,6 +32,15 @@
 	};
 
 	/**
+	 * Stop the progress display and show an import error.
+	 */
+	productImportForm.prototype.show_error = function( message ) {
+		this.$form.find( 'header .spinner' ).removeClass( 'is-active' );
+		this.$form.find( 'header h2' ).text( message );
+		this.$form.find( 'header p, section' ).hide();
+	};
+
+	/**
 	 * Run the import in batches until finished.
 	 */
 	productImportForm.prototype.run_import = function() {
@@ -79,10 +88,20 @@
 					} else {
 						$this.run_import();
 					}
+				} else {
+					$this.show_error(
+						response.data && response.data.message ?
+							response.data.message :
+							wc_product_import_params.import_error
+					);
 				}
 			}
 		} ).fail( function( response ) {
-			window.console.log( response );
+			$this.show_error(
+				response.responseJSON && response.responseJSON.data && response.responseJSON.data.message ?
+					response.responseJSON.data.message :
+					wc_product_import_params.import_error
+			);
 		} );
 	};
 

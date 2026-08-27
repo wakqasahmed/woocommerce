@@ -268,17 +268,36 @@ class WC_Product_CSV_Importer_Controller_Test extends WC_Unit_Test_Case {
 				)
 			);
 		}
+		$completed_product = WC_Helper_Product::create_simple_product();
+		$completed_id      = $completed_product->get_id();
+		add_post_meta( $completed_id, '_original_id', '12345' );
+		$post_id_limit = $this->get_import_cleanup_post_id_limit();
+		$late_post_id  = 0;
 
 		try {
-			$this->assertFalse( $this->invoke_cleanup_after_import() );
+			$this->assertFalse( $this->invoke_cleanup_after_import( $post_id_limit ) );
 			$this->assertSame( 1, (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'product' AND post_status = 'importing'" ) );
+			$this->assertSame( 1, (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = '_original_id'", $completed_id ) ), 'Mapping markers should survive until every cleanup batch finishes.' );
 
-			$this->assertTrue( $this->invoke_cleanup_after_import() );
-			$this->assertSame( 0, (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'product' AND post_status = 'importing'" ) );
+			$late_post_id = wp_insert_post(
+				array(
+					'post_type'   => 'product',
+					'post_status' => 'importing',
+					'post_title'  => 'Later import placeholder',
+				)
+			);
+			add_post_meta( $late_post_id, '_original_id', '67890' );
+
+			$this->assertTrue( $this->invoke_cleanup_after_import( $post_id_limit ) );
+			$this->assertSame( 1, (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'product' AND post_status = 'importing'" ), 'A placeholder created after cleanup started should remain.' );
+			$this->assertSame( 0, (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = '_original_id'", $completed_id ) ) );
+			$this->assertSame( 1, (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = '_original_id'", $late_post_id ) ), 'Mapping markers created after cleanup started should remain.' );
 		} finally {
 			foreach ( $post_ids as $post_id ) {
 				wp_delete_post( $post_id, true );
 			}
+			wp_delete_post( $late_post_id, true );
+			wp_delete_post( $completed_id, true );
 		}
 	}
 
@@ -312,14 +331,28 @@ class WC_Product_CSV_Importer_Controller_Test extends WC_Unit_Test_Case {
 	/**
 	 * Invoke the import cleanup routine.
 	 *
+	 * @param int|null $post_id_limit Highest post ID eligible for cleanup, or null to capture it now.
 	 * @return bool Whether all importer placeholders have been removed.
 	 */
-	private function invoke_cleanup_after_import(): bool {
+	private function invoke_cleanup_after_import( ?int $post_id_limit = null ): bool {
 		$class  = new ReflectionClass( WC_Product_CSV_Importer_Controller::class );
 		$method = $class->getMethod( 'cleanup_after_import' );
 		$method->setAccessible( true );
 
-		return (bool) $method->invoke( null );
+		return (bool) $method->invoke( null, $post_id_limit ?? $this->get_import_cleanup_post_id_limit() );
+	}
+
+	/**
+	 * Capture the highest post ID eligible for an import cleanup run.
+	 *
+	 * @return int Post ID limit.
+	 */
+	private function get_import_cleanup_post_id_limit(): int {
+		$class  = new ReflectionClass( WC_Product_CSV_Importer_Controller::class );
+		$method = $class->getMethod( 'get_import_cleanup_post_id_limit' );
+		$method->setAccessible( true );
+
+		return (int) $method->invoke( null );
 	}
 
 	/**
