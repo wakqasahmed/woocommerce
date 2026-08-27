@@ -27,6 +27,11 @@ if ( ! class_exists( 'WP_Importer' ) ) {
 class WC_Product_CSV_Importer_Controller {
 
 	/**
+	 * Maximum number of importer placeholders deleted in one request.
+	 */
+	private const IMPORT_CLEANUP_BATCH_SIZE = 30;
+
+	/**
 	 * The path to the current file.
 	 *
 	 * @var string
@@ -317,13 +322,18 @@ class WC_Product_CSV_Importer_Controller {
 	}
 
 	/**
-	 * Remove temporary products and mapping data left by the importer.
+	 * Remove one batch of temporary products and mapping data left by the importer.
+	 *
+	 * @throws RuntimeException When a placeholder cannot be deleted.
+	 * @return bool Whether all importer placeholders have been removed.
 	 */
-	private static function cleanup_after_import(): void {
+	private static function cleanup_after_import(): bool {
 		global $wpdb;
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- The importer requires one uncached cleanup of its temporary mapping markers.
 		$wpdb->delete( $wpdb->postmeta, array( 'meta_key' => '_original_id' ) );
+
+		$remaining_batch_size = self::IMPORT_CLEANUP_BATCH_SIZE;
 
 		// Delete products first so WooCommerce can remove their variations through the normal lifecycle.
 		foreach ( array( 'product', 'product_variation' ) as $post_type ) {
@@ -331,16 +341,31 @@ class WC_Product_CSV_Importer_Controller {
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
 			$post_ids = $wpdb->get_col(
 				$wpdb->prepare(
-					"SELECT ID FROM {$wpdb->posts} WHERE post_type = %s AND post_status = %s",
+					"SELECT ID FROM {$wpdb->posts} WHERE post_type = %s AND post_status = %s LIMIT %d",
 					$post_type,
-					'importing'
+					'importing',
+					$remaining_batch_size + 1
 				)
 			);
+			$has_more = count( $post_ids ) > $remaining_batch_size;
+			$post_ids = array_slice( $post_ids, 0, $remaining_batch_size );
 
 			foreach ( $post_ids as $post_id ) {
-				wp_delete_post( absint( $post_id ), true );
+				$deleted_post = wp_delete_post( absint( $post_id ), true );
+
+				if ( ! $deleted_post && get_post( $post_id ) ) {
+					throw new RuntimeException( esc_html__( 'Import cleanup could not be completed.', 'woocommerce' ) );
+				}
+			}
+
+			$remaining_batch_size -= count( $post_ids );
+
+			if ( $has_more || 0 === $remaining_batch_size ) {
+				return false;
 			}
 		}
+
+		return true;
 	}
 
 	/**
@@ -390,7 +415,19 @@ class WC_Product_CSV_Importer_Controller {
 			update_user_option( get_current_user_id(), 'product_import_error_log', $error_log );
 
 			if ( 100 === $percent_complete ) {
-				self::cleanup_after_import();
+				if ( ! self::cleanup_after_import() ) {
+					wp_send_json_success(
+						array(
+							'position'            => $importer->get_file_position(),
+							'percentage'          => 100,
+							'imported'            => is_countable( $results['imported'] ) ? count( $results['imported'] ) : 0,
+							'imported_variations' => is_countable( $results['imported_variations'] ) ? count( $results['imported_variations'] ) : 0,
+							'failed'              => is_countable( $results['failed'] ) ? count( $results['failed'] ) : 0,
+							'updated'             => is_countable( $results['updated'] ) ? count( $results['updated'] ) : 0,
+							'skipped'             => is_countable( $results['skipped'] ) ? count( $results['skipped'] ) : 0,
+						)
+					);
+				}
 
 				// Send success.
 				wp_send_json_success(

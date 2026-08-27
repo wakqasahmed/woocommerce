@@ -253,13 +253,73 @@ class WC_Product_CSV_Importer_Controller_Test extends WC_Unit_Test_Case {
 	}
 
 	/**
-	 * Invoke the import cleanup routine.
+	 * @testdox Import cleanup should split large placeholder sets across requests.
 	 */
-	private function invoke_cleanup_after_import(): void {
+	public function test_cleanup_after_import_processes_a_bounded_batch(): void {
+		global $wpdb;
+
+		$post_ids = array();
+		for ( $index = 0; $index < 31; $index++ ) {
+			$post_ids[] = wp_insert_post(
+				array(
+					'post_type'   => 'product',
+					'post_status' => 'importing',
+					'post_title'  => 'Import cleanup batch placeholder',
+				)
+			);
+		}
+
+		try {
+			$this->assertFalse( $this->invoke_cleanup_after_import() );
+			$this->assertSame( 1, (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'product' AND post_status = 'importing'" ) );
+
+			$this->assertTrue( $this->invoke_cleanup_after_import() );
+			$this->assertSame( 0, (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'product' AND post_status = 'importing'" ) );
+		} finally {
+			foreach ( $post_ids as $post_id ) {
+				wp_delete_post( $post_id, true );
+			}
+		}
+	}
+
+	/**
+	 * @testdox Import cleanup should fail when a placeholder cannot be deleted.
+	 */
+	public function test_cleanup_after_import_reports_a_vetoed_deletion(): void {
+		$post_id          = wp_insert_post(
+			array(
+				'post_type'   => 'product',
+				'post_status' => 'importing',
+				'post_title'  => 'Vetoed import cleanup placeholder',
+			)
+		);
+		$prevent_deletion = static function ( $delete, $post ) use ( $post_id ) {
+			return $post_id === $post->ID ? false : $delete;
+		};
+		add_filter( 'pre_delete_post', $prevent_deletion, 10, 2 );
+
+		try {
+			$this->expectException( RuntimeException::class );
+			$this->expectExceptionMessage( 'Import cleanup could not be completed.' );
+
+			$this->invoke_cleanup_after_import();
+		} finally {
+			remove_filter( 'pre_delete_post', $prevent_deletion, 10 );
+			wp_delete_post( $post_id, true );
+		}
+	}
+
+	/**
+	 * Invoke the import cleanup routine.
+	 *
+	 * @return bool Whether all importer placeholders have been removed.
+	 */
+	private function invoke_cleanup_after_import(): bool {
 		$class  = new ReflectionClass( WC_Product_CSV_Importer_Controller::class );
 		$method = $class->getMethod( 'cleanup_after_import' );
 		$method->setAccessible( true );
-		$method->invoke( null );
+
+		return (bool) $method->invoke( null );
 	}
 
 	/**
