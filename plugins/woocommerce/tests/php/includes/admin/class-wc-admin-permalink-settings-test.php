@@ -389,6 +389,30 @@ class WC_Admin_Permalink_Settings_Test extends WC_Unit_Test_Case {
 	}
 
 	/**
+	 * @testdox Should match encoded and decoded forms of a non-ASCII Shop page path.
+	 */
+	public function test_verbose_page_rules_support_an_encoded_shop_path(): void {
+		$shop_page_id = self::factory()->post->create(
+			array(
+				'post_type'   => 'page',
+				'post_title'  => 'Магазин',
+				'post_name'   => 'магазин',
+				'post_status' => 'publish',
+			)
+		);
+		update_option( 'woocommerce_shop_page_id', $shop_page_id );
+
+		$encoded_path = get_page_uri( $shop_page_id );
+		$decoded_path = rawurldecode( $encoded_path );
+		$this->assertNotSame( $encoded_path, $decoded_path, 'The fixture should expose encoded and decoded path forms.' );
+
+		foreach ( array( $encoded_path, $decoded_path ) as $product_base ) {
+			$this->save_and_render( 'custom', '/' . $product_base . '/' );
+			$this->assertTrue( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
+		}
+	}
+
+	/**
 	 * @testdox Should clear verbose page rules when no Shop page exists.
 	 */
 	public function test_verbose_page_rules_require_an_existing_shop_page(): void {

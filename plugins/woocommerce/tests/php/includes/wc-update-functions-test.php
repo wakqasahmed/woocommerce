@@ -468,4 +468,53 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 		$this->assertArrayHasKey( 'customer_stock_notifications', $changes );
 		$this->assertTrue( $changes['customer_stock_notifications'] );
 	}
+
+	/**
+	 * @testdox Migration repairs the derived verbose page rules value and queues a rewrite flush only when it changes.
+	 */
+	public function test_wc_update_1120_recalculate_product_permalink_verbose_page_rules(): void {
+		include_once WC_ABSPATH . 'includes/wc-update-functions.php';
+
+		$db_updates = WC_Install::get_db_update_callbacks();
+		$this->assertArrayHasKey( '11.2.0', $db_updates );
+		$this->assertContains( 'wc_update_1120_recalculate_product_permalink_verbose_page_rules', $db_updates['11.2.0'] );
+
+		$shop_page_id = self::factory()->post->create(
+			array(
+				'post_type'   => 'page',
+				'post_title'  => 'Shop',
+				'post_name'   => 'shop',
+				'post_status' => 'publish',
+			)
+		);
+		update_option( 'woocommerce_shop_page_id', $shop_page_id );
+
+		$permalinks = array(
+			'product_base'           => 'product',
+			'use_verbose_page_rules' => true,
+			'unrelated_setting'      => 'preserved',
+		);
+		update_option( 'woocommerce_permalinks', $permalinks );
+		delete_option( 'woocommerce_queue_flush_rewrite_rules' );
+
+		wc_update_1120_recalculate_product_permalink_verbose_page_rules();
+
+		$permalinks = get_option( 'woocommerce_permalinks' );
+		$this->assertFalse( $permalinks['use_verbose_page_rules'] );
+		$this->assertSame( 'preserved', $permalinks['unrelated_setting'] );
+		$this->assertSame( 'yes', get_option( 'woocommerce_queue_flush_rewrite_rules' ) );
+
+		delete_option( 'woocommerce_queue_flush_rewrite_rules' );
+		wc_update_1120_recalculate_product_permalink_verbose_page_rules();
+		$this->assertFalse( get_option( 'woocommerce_queue_flush_rewrite_rules', false ), 'An unchanged value should not queue another rewrite flush.' );
+
+		$permalinks['product_base']           = '/shop/%product_cat%';
+		$permalinks['use_verbose_page_rules'] = false;
+		update_option( 'woocommerce_permalinks', $permalinks );
+
+		wc_update_1120_recalculate_product_permalink_verbose_page_rules();
+
+		$this->assertTrue( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
+		$this->assertSame( 'yes', get_option( 'woocommerce_queue_flush_rewrite_rules' ) );
+	}
 }
