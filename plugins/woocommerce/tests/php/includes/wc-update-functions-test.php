@@ -516,5 +516,61 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 
 		$this->assertTrue( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
 		$this->assertSame( 'yes', get_option( 'woocommerce_queue_flush_rewrite_rules' ) );
+
+		delete_option( 'woocommerce_shop_page_id' );
+		delete_option( 'woocommerce_queue_flush_rewrite_rules' );
+		$permalinks['use_verbose_page_rules'] = true;
+		update_option( 'woocommerce_permalinks', $permalinks );
+
+		wc_update_1120_recalculate_product_permalink_verbose_page_rules();
+
+		$this->assertFalse( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
+		$this->assertSame( 'yes', get_option( 'woocommerce_queue_flush_rewrite_rules' ) );
+	}
+
+	/**
+	 * @testdox Permalink migration resolves filtered Shop pages in the site locale and restores the request locale.
+	 */
+	public function test_wc_update_1120_recalculate_product_permalink_verbose_page_rules_uses_site_locale(): void {
+		include_once WC_ABSPATH . 'includes/wc-update-functions.php';
+
+		$site_shop_page_id    = self::factory()->post->create(
+			array(
+				'post_type'   => 'page',
+				'post_title'  => 'Shop',
+				'post_name'   => 'shop',
+				'post_status' => 'publish',
+			)
+		);
+		$request_shop_page_id = self::factory()->post->create(
+			array(
+				'post_type'   => 'page',
+				'post_title'  => 'Boutique',
+				'post_name'   => 'boutique',
+				'post_status' => 'publish',
+			)
+		);
+		update_option( 'woocommerce_shop_page_id', $site_shop_page_id );
+		update_option(
+			'woocommerce_permalinks',
+			array(
+				'product_base'           => '/shop',
+				'use_verbose_page_rules' => false,
+			)
+		);
+
+		$filter_shop_page = static function ( $shop_page_id ) use ( $request_shop_page_id ) {
+			return has_filter( 'plugin_locale', 'get_locale' ) ? $shop_page_id : $request_shop_page_id;
+		};
+		add_filter( 'woocommerce_get_shop_page_id', $filter_shop_page );
+
+		try {
+			wc_update_1120_recalculate_product_permalink_verbose_page_rules();
+
+			$this->assertTrue( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
+			$this->assertFalse( has_filter( 'plugin_locale', 'get_locale' ), 'The site-locale filter should be removed after the migration.' );
+		} finally {
+			remove_filter( 'woocommerce_get_shop_page_id', $filter_shop_page );
+		}
 	}
 }

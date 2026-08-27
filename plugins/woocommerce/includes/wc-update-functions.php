@@ -3715,9 +3715,15 @@ function wc_update_1120_recalculate_product_permalink_verbose_page_rules(): void
 	$permalinks   = (array) get_option( 'woocommerce_permalinks', array() );
 	$product_base = $permalinks['product_base'] ?? '';
 	$product_base = is_string( $product_base ) ? trim( rawurldecode( $product_base ), '/' ) : '';
-	$shop_page_id = wc_get_page_id( 'shop' );
-	$shop_page    = $shop_page_id > 0 ? get_post( $shop_page_id ) : null;
-	$shop_base    = $shop_page instanceof WP_Post && 'page' === $shop_page->post_type ? trim( rawurldecode( (string) get_page_uri( $shop_page_id ) ), '/' ) : '';
+
+	wc_switch_to_site_locale();
+	try {
+		$shop_page_id = wc_get_page_id( 'shop' );
+		$shop_page    = $shop_page_id > 0 ? get_post( $shop_page_id ) : null;
+		$shop_base    = $shop_page instanceof WP_Post && 'page' === $shop_page->post_type ? trim( rawurldecode( (string) get_page_uri( $shop_page_id ) ), '/' ) : '';
+	} finally {
+		wc_restore_locale();
+	}
 
 	$current_value          = ! empty( $permalinks['use_verbose_page_rules'] );
 	$use_verbose_page_rules = '' !== $shop_base && ( $shop_base === $product_base || 0 === strpos( $product_base, $shop_base . '/' ) );
