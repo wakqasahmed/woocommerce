@@ -276,7 +276,7 @@ class WC_Product_CSV_Importer_Controller_Test extends WC_Unit_Test_Case {
 
 		try {
 			$this->assertFalse( $this->invoke_cleanup_after_import( $post_id_limit ) );
-			$this->assertSame( 1, (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'product' AND post_status = 'importing'" ) );
+			$this->assertCount( 1, array_filter( array_map( 'get_post', $post_ids ) ) );
 			$this->assertSame( 1, (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = '_original_id'", $completed_id ) ), 'Mapping markers should survive until every cleanup batch finishes.' );
 
 			$late_post_id = wp_insert_post(
@@ -289,7 +289,8 @@ class WC_Product_CSV_Importer_Controller_Test extends WC_Unit_Test_Case {
 			add_post_meta( $late_post_id, '_original_id', '67890' );
 
 			$this->assertTrue( $this->invoke_cleanup_after_import( $post_id_limit ) );
-			$this->assertSame( 1, (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'product' AND post_status = 'importing'" ), 'A placeholder created after cleanup started should remain.' );
+			$this->assertCount( 0, array_filter( array_map( 'get_post', $post_ids ) ) );
+			$this->assertNotNull( get_post( $late_post_id ), 'A placeholder created after cleanup started should remain.' );
 			$this->assertSame( 0, (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = '_original_id'", $completed_id ) ) );
 			$this->assertSame( 1, (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = '_original_id'", $late_post_id ) ), 'Mapping markers created after cleanup started should remain.' );
 		} finally {
@@ -313,7 +314,7 @@ class WC_Product_CSV_Importer_Controller_Test extends WC_Unit_Test_Case {
 			)
 		);
 		$prevent_deletion = static function ( $delete, $post ) use ( $post_id ) {
-			return $post_id === $post->ID ? false : $delete;
+			return $post_id === $post->ID ? $post : $delete;
 		};
 		add_filter( 'pre_delete_post', $prevent_deletion, 10, 2 );
 

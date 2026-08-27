@@ -367,10 +367,11 @@ class WC_Product_CSV_Importer_Controller {
 			$post_ids = array_slice( $post_ids, 0, $remaining_batch_size );
 
 			foreach ( $post_ids as $post_id ) {
-				$deleted_post = wp_delete_post( absint( $post_id ), true );
+				wp_delete_post( absint( $post_id ), true );
 
-				if ( ! $deleted_post && get_post( $post_id ) ) {
-					throw new RuntimeException( esc_html__( 'Import cleanup could not be completed.', 'woocommerce' ) );
+				if ( get_post( $post_id ) ) {
+					// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The JSON response is rendered with jQuery .text().
+					throw new RuntimeException( __( 'Import cleanup could not be completed.', 'woocommerce' ) );
 				}
 			}
 
@@ -616,7 +617,7 @@ class WC_Product_CSV_Importer_Controller {
 				'update_existing'    => $this->update_existing,
 				'delimiter'          => $this->delimiter,
 				'character_encoding' => $this->character_encoding,
-				'import_error'       => esc_html__( 'Import could not be completed.', 'woocommerce' ),
+				'import_error'       => __( 'Import could not be completed.', 'woocommerce' ),
 			)
 		);
 		wp_enqueue_script( 'wc-product-import' );
