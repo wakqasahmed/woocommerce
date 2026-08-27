@@ -331,6 +331,99 @@ class WC_Admin_Permalink_Settings_Test extends WC_Unit_Test_Case {
 	}
 
 	/**
+	 * @testdox Should set and clear verbose page rules as the product base changes.
+	 */
+	public function test_verbose_page_rules_follow_the_current_product_base(): void {
+		$base_slug = urldecode( get_page_uri( $this->ensure_shop_page() ) );
+
+		$permalinks                      = (array) get_option( 'woocommerce_permalinks', array() );
+		$permalinks['unrelated_setting'] = 'preserved';
+		update_option( 'woocommerce_permalinks', $permalinks );
+
+		$this->save_and_render( '/' . trailingslashit( $base_slug ) );
+		$permalinks = (array) get_option( 'woocommerce_permalinks', array() );
+		$this->assertTrue( $permalinks['use_verbose_page_rules'], 'The Shop base should enable verbose page rules.' );
+
+		$this->save_and_render( '' );
+		$permalinks = (array) get_option( 'woocommerce_permalinks', array() );
+		$this->assertFalse( $permalinks['use_verbose_page_rules'], 'The Default base should clear stale verbose page rules.' );
+		$this->assertSame( 'preserved', $permalinks['unrelated_setting'], 'Saving permalinks should preserve unrelated option data.' );
+	}
+
+	/**
+	 * @testdox Should match the Shop base only at the start of a complete path segment.
+	 *
+	 * @testWith ["/shop", true]
+	 *           ["/shop/%product_cat%", true]
+	 *           ["/webshop", false]
+	 *           ["/shopper", false]
+	 *           ["/catalog/shop", false]
+	 *
+	 * @param string $product_base Product permalink base.
+	 * @param bool   $expected     Expected verbose page rules value.
+	 */
+	public function test_verbose_page_rules_require_a_shop_path_boundary( string $product_base, bool $expected ): void {
+		$shop_page_id = $this->ensure_shop_page();
+		$this->assertSame( 'shop', urldecode( get_page_uri( $shop_page_id ) ), 'The fixture should use the Shop path.' );
+
+		$permalinks                           = (array) get_option( 'woocommerce_permalinks', array() );
+		$permalinks['use_verbose_page_rules'] = ! $expected;
+		update_option( 'woocommerce_permalinks', $permalinks );
+
+		$this->save_and_render( 'custom', $product_base );
+
+		$this->assertSame( $expected, get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
+	}
+
+	/**
+	 * @testdox Should match the full path of a nested Shop page.
+	 */
+	public function test_verbose_page_rules_support_a_nested_shop_path(): void {
+		$this->ensure_nested_shop_page();
+
+		$this->save_and_render( 'custom', '/stores/shop/%product_cat%/' );
+		$this->assertTrue( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
+
+		$this->save_and_render( 'custom', '/stores/shopper/' );
+		$this->assertFalse( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
+	}
+
+	/**
+	 * @testdox Should clear verbose page rules when no Shop page exists.
+	 */
+	public function test_verbose_page_rules_require_an_existing_shop_page(): void {
+		delete_option( 'woocommerce_shop_page_id' );
+		$permalinks                           = (array) get_option( 'woocommerce_permalinks', array() );
+		$permalinks['use_verbose_page_rules'] = true;
+		update_option( 'woocommerce_permalinks', $permalinks );
+
+		$this->save_and_render( 'custom', '/shop/' );
+
+		$this->assertFalse( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
+	}
+
+	/**
+	 * @testdox Should clear verbose page rules when the configured Shop ID is not a page.
+	 */
+	public function test_verbose_page_rules_require_the_shop_post_type(): void {
+		$post_id = self::factory()->post->create(
+			array(
+				'post_type'   => 'post',
+				'post_name'   => 'shop-article',
+				'post_status' => 'publish',
+			)
+		);
+		update_option( 'woocommerce_shop_page_id', $post_id );
+		$permalinks                           = (array) get_option( 'woocommerce_permalinks', array() );
+		$permalinks['use_verbose_page_rules'] = true;
+		update_option( 'woocommerce_permalinks', $permalinks );
+
+		$this->save_and_render( 'custom', '/shop-article/' );
+
+		$this->assertFalse( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
+	}
+
+	/**
 	 * A Shop page slug equal to the default product slug makes "Default" and "Shop base"
 	 * indistinguishable once stored: both persist the bare default base, so the checked-state
 	 * search — which maps a stored base back to whichever predefined choice would persist it —

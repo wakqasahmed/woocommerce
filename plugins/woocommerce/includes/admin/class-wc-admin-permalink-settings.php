@@ -109,6 +109,26 @@ class WC_Admin_Permalink_Settings {
 	}
 
 	/**
+	 * Check whether the product base starts with the full Shop page path.
+	 *
+	 * @param string $product_base Product permalink base.
+	 * @param int    $shop_page_id Shop page ID.
+	 * @return bool Whether Shop subpage rewrite rules are needed.
+	 */
+	private function should_use_verbose_page_rules( string $product_base, int $shop_page_id ): bool {
+		$shop_page = $shop_page_id > 0 ? get_post( $shop_page_id ) : null;
+
+		if ( ! $shop_page instanceof WP_Post || 'page' !== $shop_page->post_type ) {
+			return false;
+		}
+
+		$product_base = trim( rawurldecode( $product_base ), '/' );
+		$shop_base    = trim( rawurldecode( $this->get_shop_base_slug( $shop_page_id ) ), '/' );
+
+		return '' !== $shop_base && ( $shop_base === $product_base || 0 === strpos( $product_base, $shop_base . '/' ) );
+	}
+
+	/**
 	 * Resolve a posted product permalink choice to the value that gets persisted for it.
 	 *
 	 * The render path checks a radio by comparing the stored base against this, and the save path
@@ -318,13 +338,9 @@ class WC_Admin_Permalink_Settings {
 			// value is the same site-locale form settings() compares against.
 			$permalinks['product_base'] = $this->get_stored_product_base( $product_base, $posted_structure );
 
-			// Shop base may require verbose page rules if nesting pages.
-			$shop_page_id   = wc_get_page_id( 'shop' );
-			$shop_permalink = $this->get_shop_base_slug( $shop_page_id );
-
-			if ( $shop_page_id && stristr( trim( $permalinks['product_base'], '/' ), $shop_permalink ) ) {
-				$permalinks['use_verbose_page_rules'] = true;
-			}
+			// Shop subpages need verbose page rules only while products use the Shop page path.
+			$shop_page_id                         = wc_get_page_id( 'shop' );
+			$permalinks['use_verbose_page_rules'] = $this->should_use_verbose_page_rules( $permalinks['product_base'], $shop_page_id );
 
 			update_option( 'woocommerce_permalinks', $permalinks );
 			wc_restore_locale();
