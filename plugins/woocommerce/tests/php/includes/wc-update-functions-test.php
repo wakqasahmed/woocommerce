@@ -6,6 +6,9 @@
  */
 
 use Automattic\Jetpack\Constants;
+use Automattic\WooCommerce\Admin\Notes\Note;
+use Automattic\WooCommerce\Admin\Notes\Notes;
+use Automattic\WooCommerce\Blocks\InboxNotifications;
 use Automattic\WooCommerce\Blocks\Options as BlockOptions;
 use Automattic\WooCommerce\Blocks\Utils\BlockTemplateUtils;
 use Automattic\WooCommerce\Internal\Features\FeaturesController;
@@ -467,5 +470,32 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 
 		$this->assertArrayHasKey( 'customer_stock_notifications', $changes );
 		$this->assertTrue( $changes['customer_stock_notifications'] );
+	}
+
+	/**
+	 * @testdox Migration registers under a unique update key and deletes the retired Surface Cart and Checkout note.
+	 */
+	public function test_wc_update_11201_delete_surface_cart_checkout_note(): void {
+		include_once WC_ABSPATH . 'includes/wc-update-functions.php';
+
+		$db_updates = WC_Install::get_db_update_callbacks();
+		$this->assertArrayHasKey( '11.2.0-1', $db_updates );
+		$this->assertContains( 'wc_update_11201_delete_surface_cart_checkout_note', $db_updates['11.2.0-1'] );
+
+		$note = new Note();
+		$note->set_name( InboxNotifications::SURFACE_CART_CHECKOUT_NOTE_NAME );
+		$note->set_title( 'Surface Cart and Checkout' );
+		$note->set_content( 'Test content' );
+		$note->set_type( Note::E_WC_ADMIN_NOTE_INFORMATIONAL );
+		$note->set_source( 'PHPUNIT_TEST' );
+		$note->add_action( 'learn-more', 'Learn more', 'https://woocommerce.com/' );
+		$note->save();
+
+		wc_update_11201_delete_surface_cart_checkout_note();
+
+		$this->assertFalse( Notes::get_note_by_name( InboxNotifications::SURFACE_CART_CHECKOUT_NOTE_NAME ), 'The retired note should be deleted during the update.' );
+
+		wc_update_11201_delete_surface_cart_checkout_note();
+		$this->assertFalse( Notes::get_note_by_name( InboxNotifications::SURFACE_CART_CHECKOUT_NOTE_NAME ), 'The update should remain safe when the note is already absent.' );
 	}
 }
