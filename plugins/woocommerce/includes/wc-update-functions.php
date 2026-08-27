@@ -3712,6 +3712,6 @@ function wc_update_1120_migrate_stock_notifications_alpha_constant() {
  *
  * @return void
  */
-function wc_update_11201_delete_surface_cart_checkout_note(): void {
+function wc_update_1120_delete_surface_cart_checkout_note(): void {
 	InboxNotifications::delete_surface_cart_checkout_blocks_notification();
 }

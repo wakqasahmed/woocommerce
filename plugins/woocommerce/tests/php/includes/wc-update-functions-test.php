@@ -473,14 +473,14 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 	}
 
 	/**
-	 * @testdox Migration registers under a unique update key and deletes the retired Surface Cart and Checkout note.
+	 * @testdox Migration registers for WooCommerce 11.2.0 and deletes the retired Surface Cart and Checkout note.
 	 */
-	public function test_wc_update_11201_delete_surface_cart_checkout_note(): void {
+	public function test_wc_update_1120_delete_surface_cart_checkout_note(): void {
 		include_once WC_ABSPATH . 'includes/wc-update-functions.php';
 
 		$db_updates = WC_Install::get_db_update_callbacks();
-		$this->assertArrayHasKey( '11.2.0-1', $db_updates );
-		$this->assertContains( 'wc_update_11201_delete_surface_cart_checkout_note', $db_updates['11.2.0-1'] );
+		$this->assertArrayHasKey( '11.2.0', $db_updates );
+		$this->assertContains( 'wc_update_1120_delete_surface_cart_checkout_note', $db_updates['11.2.0'] );
 
 		$note = new Note();
 		$note->set_name( InboxNotifications::SURFACE_CART_CHECKOUT_NOTE_NAME );
@@ -491,11 +491,11 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 		$note->add_action( 'learn-more', 'Learn more', 'https://woocommerce.com/' );
 		$note->save();
 
-		wc_update_11201_delete_surface_cart_checkout_note();
+		wc_update_1120_delete_surface_cart_checkout_note();
 
 		$this->assertFalse( Notes::get_note_by_name( InboxNotifications::SURFACE_CART_CHECKOUT_NOTE_NAME ), 'The retired note should be deleted during the update.' );
 
-		wc_update_11201_delete_surface_cart_checkout_note();
+		wc_update_1120_delete_surface_cart_checkout_note();
 		$this->assertFalse( Notes::get_note_by_name( InboxNotifications::SURFACE_CART_CHECKOUT_NOTE_NAME ), 'The update should remain safe when the note is already absent.' );
 	}
 }
