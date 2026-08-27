@@ -303,6 +303,56 @@ class WC_Product_CSV_Importer_Controller_Test extends WC_Unit_Test_Case {
 	}
 
 	/**
+	 * @testdox Import cleanup should preserve a placeholder published after batch selection.
+	 */
+	public function test_cleanup_after_import_rechecks_placeholder_status_before_deletion(): void {
+		$post_ids                  = array(
+			wp_insert_post(
+				array(
+					'post_type'   => 'product',
+					'post_status' => 'importing',
+					'post_title'  => 'First import cleanup placeholder',
+				)
+			),
+			wp_insert_post(
+				array(
+					'post_type'   => 'product',
+					'post_status' => 'importing',
+					'post_title'  => 'Second import cleanup placeholder',
+				)
+			),
+		);
+		$published_id              = 0;
+		$publish_other_placeholder = static function ( $deleted_post_id ) use ( $post_ids, &$published_id ): void {
+			if ( ! in_array( $deleted_post_id, $post_ids, true ) || $published_id ) {
+				return;
+			}
+
+			$published_id = current( array_diff( $post_ids, array( $deleted_post_id ) ) );
+			wp_update_post(
+				array(
+					'ID'          => $published_id,
+					'post_status' => 'publish',
+				)
+			);
+		};
+		add_action( 'delete_post', $publish_other_placeholder, 1 );
+
+		try {
+			$this->assertTrue( $this->invoke_cleanup_after_import() );
+			$this->assertNotSame( 0, $published_id );
+			$this->assertNotNull( get_post( $published_id ) );
+			$this->assertSame( 'publish', get_post_status( $published_id ) );
+			$this->assertCount( 1, array_filter( array_map( 'get_post', $post_ids ) ) );
+		} finally {
+			remove_action( 'delete_post', $publish_other_placeholder, 1 );
+			foreach ( $post_ids as $post_id ) {
+				wp_delete_post( $post_id, true );
+			}
+		}
+	}
+
+	/**
 	 * @testdox Import cleanup should fail when a placeholder cannot be deleted.
 	 */
 	public function test_cleanup_after_import_reports_a_vetoed_deletion(): void {

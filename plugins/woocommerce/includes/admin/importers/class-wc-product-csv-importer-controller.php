@@ -367,6 +367,12 @@ class WC_Product_CSV_Importer_Controller {
 			$post_ids = array_slice( $post_ids, 0, $remaining_batch_size );
 
 			foreach ( $post_ids as $post_id ) {
+				$post = get_post( $post_id );
+
+				if ( ! $post || $post_type !== $post->post_type || 'importing' !== $post->post_status ) {
+					continue;
+				}
+
 				wp_delete_post( absint( $post_id ), true );
 
 				if ( get_post( $post_id ) ) {
