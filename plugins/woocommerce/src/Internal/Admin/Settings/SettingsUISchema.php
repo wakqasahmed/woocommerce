@@ -458,7 +458,7 @@ class SettingsUISchema {
 	 * existing callers while letting request resolution issue one aggregate
 	 * compatibility notice for the complete native-provider pass.
 	 *
-	 * @since 11.1.0
+	 * @since 11.2.0
 	 *
 	 * @param array $schema Settings UI schema.
 	 * @param bool  $legacy_derived Whether the schema came from legacy settings definitions.
@@ -534,7 +534,7 @@ class SettingsUISchema {
 				$converted_fields,
 				/* translators: %s: comma-separated field ids. */
 				__( 'A Settings UI schema provider supplied legacy field values or metadata that WooCommerce converted for compatibility: %s. Update the provider to supply canonical values.', 'woocommerce' ),
-				'11.1.0'
+				'11.2.0'
 			);
 		}
 
