@@ -29,6 +29,23 @@ describe( 'getHiddenInputs', () => {
 		).toEqual( [ { name: 'enabled', value: 'yes' } ] );
 	} );
 
+	it.each( [ 'yes', '1' ] )(
+		'treats the legacy truthy-string checkbox value %p as checked',
+		( legacyValue ) => {
+			expect(
+				getHiddenInputs(
+					{
+						id: 'enabled',
+						label: 'Enabled',
+						type: 'checkbox',
+						save: { adapter: 'form_post', name: 'enabled' },
+					},
+					legacyValue
+				)
+			).toEqual( [ { name: 'enabled', value: 'yes' } ] );
+		}
+	);
+
 	it( 'serializes changed checkbox values instead of their original form representation', () => {
 		expect(
 			getHiddenInputs(

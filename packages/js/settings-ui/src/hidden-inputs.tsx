@@ -42,7 +42,12 @@ const serializeCanonicalValue = (
 	value: SettingsValue
 ): HiddenInput[] => {
 	if ( field.type === 'checkbox' ) {
-		return [ { name, value: value === true ? 'yes' : 'no' } ];
+		// Accept the canonical boolean as well as the legacy truthy-string
+		// forms ('yes'/'1') that the exported getHiddenInputs()/HiddenInputs()
+		// API accepted before value canonicalization, so external callers
+		// passing a classic checkbox value do not get it silently flipped off.
+		const isChecked = value === true || value === 'yes' || value === '1';
+		return [ { name, value: isChecked ? 'yes' : 'no' } ];
 	}
 
 	if ( field.type === 'array' ) {
