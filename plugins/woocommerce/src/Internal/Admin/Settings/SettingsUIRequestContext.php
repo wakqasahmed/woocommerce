@@ -691,7 +691,16 @@ class SettingsUIRequestContext {
 
 		try {
 			$schema = $this->settings_ui_page->get_schema( $this->section );
-			$schema = SettingsUISchema::canonicalize_schema_values( $schema, $this->settings_ui_page instanceof LegacySettingsPageAdapter );
+
+			// Legacy-derived schemas are already canonicalized inside
+			// SettingsUISchema::from_legacy_settings(). Only native providers
+			// need the canonicalization pass (and its aggregate compatibility
+			// notice) here; re-running it for legacy pages would repeat the
+			// full per-field walk on every render for no functional benefit.
+			if ( ! $this->settings_ui_page instanceof LegacySettingsPageAdapter ) {
+				$schema = SettingsUISchema::canonicalize_schema_values( $schema, false );
+			}
+
 			$schema = $this->apply_section_navigation( $schema );
 			$schema = $this->apply_shell_header_visibility( $schema );
 			$schema = $this->ensure_drill_down_breadcrumbs( $schema );
