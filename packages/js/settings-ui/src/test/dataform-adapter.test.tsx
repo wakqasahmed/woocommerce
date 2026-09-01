@@ -93,6 +93,7 @@ describe( 'dataform adapter', () => {
 			[ 'radio', 'text' ],
 			[ 'checkbox', 'boolean' ],
 			[ 'number', 'number' ],
+			[ 'integer', 'integer' ],
 			[ 'array', 'array' ],
 		];
 
@@ -548,6 +549,20 @@ describe( 'dataform adapter', () => {
 				{
 					...textField,
 					type: 'number',
+					customAttributes: { min: '0', max: 100 },
+				},
+				createOptions( [] )
+			);
+
+			expect( field.isValid?.min ).toBe( 0 );
+			expect( field.isValid?.max ).toBe( 100 );
+		} );
+
+		it( 'maps integer range attributes to numeric constraints', () => {
+			const field = buildDataFormField(
+				{
+					...textField,
+					type: 'integer',
 					customAttributes: { min: '0', max: 100 },
 				},
 				createOptions( [] )

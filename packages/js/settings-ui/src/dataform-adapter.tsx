@@ -56,6 +56,7 @@ const settingsTypeDescriptors: Record< string, SettingsTypeDescriptor > = {
 	text: { type: 'text' },
 	password: { type: 'password' },
 	number: { type: 'number' },
+	integer: { type: 'integer' },
 	checkbox: { type: 'boolean' },
 	email: { type: 'email' },
 	url: { type: 'url' },
@@ -166,7 +167,7 @@ const toRangeConstraint = (
 		return undefined;
 	}
 
-	if ( type === 'number' ) {
+	if ( type === 'number' || type === 'integer' ) {
 		const numeric = Number( value );
 		return Number.isFinite( numeric ) ? numeric : undefined;
 	}
