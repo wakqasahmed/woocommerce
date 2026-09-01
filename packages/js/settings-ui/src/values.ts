@@ -82,7 +82,7 @@ export const valueMatchesVisibilityRule = (
 ) => {
 	const expectedValues = Array.isArray( expected )
 		? expected
-		: [ expected ?? true ];
+		: [ expected === undefined ? true : expected ];
 
 	return expectedValues.some( ( expectedValue ) =>
 		areValuesEqual( value, expectedValue )

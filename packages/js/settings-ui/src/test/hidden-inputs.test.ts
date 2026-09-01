@@ -123,11 +123,11 @@ describe( 'getHiddenInputs', () => {
 			field: formPostField( {
 				save: {
 					adapter: 'form_post',
-					name: 'settings[group][quantity]',
+					name: 'settings[group][quantity',
 				},
 			} ),
 			message:
-				'Form-post field name "settings[group][quantity]" is not supported.',
+				'Form-post field name "settings[group][quantity" is not supported.',
 		},
 		{
 			label: 'list initialValue for a scalar field',
@@ -171,11 +171,11 @@ describe( 'getHiddenInputs', () => {
 			field: formPostField( {
 				save: {
 					adapter: 'form_post',
-					name: 'settings[group][quantity]',
+					name: 'settings[group][quantity',
 				},
 			} ),
 			message:
-				'Form-post field name "settings[group][quantity]" is not supported.',
+				'Form-post field name "settings[group][quantity" is not supported.',
 		},
 		{
 			label: 'list initialValue for a scalar field',
@@ -286,6 +286,21 @@ describe( 'getHiddenInputs', () => {
 		).toEqual( [ { name: 'settings[quantity]', value: '2' } ] );
 	} );
 
+	it( 'serializes deep nested names for backward compatibility', () => {
+		expect(
+			getHiddenInputs(
+				formPostField( {
+					save: {
+						adapter: 'form_post',
+						name: 'settings[group][quantity]',
+					},
+				} ),
+				2,
+				1
+			)
+		).toEqual( [ { name: 'settings[group][quantity]', value: '2' } ] );
+	} );
+
 	it( 'preserves original array entries with bracketed one-level nested names', () => {
 		expect(
 			getHiddenInputs(
@@ -321,6 +336,24 @@ describe( 'getHiddenInputs', () => {
 		).toEqual( [
 			{ name: 'settings[methods][]', value: 'card' },
 			{ name: 'settings[methods][]', value: 'link' },
+		] );
+	} );
+
+	it( 'serializes array entries with existing deep nested names', () => {
+		expect(
+			getHiddenInputs(
+				formPostField( {
+					type: 'array',
+					save: {
+						adapter: 'form_post',
+						name: 'settings[group][methods][]',
+					},
+				} ),
+				[ 'card', 'link' ]
+			)
+		).toEqual( [
+			{ name: 'settings[group][methods][]', value: 'card' },
+			{ name: 'settings[group][methods][]', value: 'link' },
 		] );
 	} );
 

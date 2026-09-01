@@ -473,6 +473,7 @@ class SettingsUISchema {
 		$converted_fields                   = array();
 		$fields_requiring_form_preservation = array();
 		$original_values                    = array();
+		$controller_types                   = array();
 
 		foreach ( $schema['groups'] as &$group ) {
 			if ( ! is_array( $group ) || ! isset( $group['fields'] ) || ! is_array( $group['fields'] ) ) {
@@ -507,6 +508,9 @@ class SettingsUISchema {
 				if ( $typed_conversion ) {
 					$converted_fields[] = $field['id'];
 				}
+				if ( isset( $field['type'] ) && is_string( $field['type'] ) ) {
+					$controller_types[ $field['id'] ] = $field['type'];
+				}
 
 				$original_value_changed = array_key_exists( $field['id'], $original_values )
 					&& array_key_exists( 'value', $field )
@@ -526,6 +530,7 @@ class SettingsUISchema {
 		}
 		unset( $group );
 
+		self::canonicalize_typed_visibility_values( $schema, $controller_types, $converted_fields );
 		self::preserve_converted_form_values( $schema, $original_values, $fields_requiring_form_preservation );
 
 		if ( ! $legacy_derived ) {
@@ -598,6 +603,106 @@ class SettingsUISchema {
 			( array_key_exists( 'value', $field ) && $original_value !== $field['value'] ) ||
 			$numeric_validation_converted
 		);
+	}
+
+	/**
+	 * Canonicalize visibility values with their controller field type.
+	 *
+	 * @param array                $schema Schema being canonicalized.
+	 * @param array<string,string> $controller_types Field types keyed by field id.
+	 * @param string[]             $converted_fields Affected field ids.
+	 * @param-out string[] $converted_fields
+	 */
+	private static function canonicalize_typed_visibility_values( array &$schema, array $controller_types, array &$converted_fields ): void {
+		foreach ( $schema['groups'] as &$group ) {
+			if ( ! is_array( $group ) || ! isset( $group['fields'] ) || ! is_array( $group['fields'] ) ) {
+				continue;
+			}
+
+			foreach ( $group['fields'] as &$field ) {
+				if ( ! is_array( $field ) || ! isset( $field['id'] ) || ! is_string( $field['id'] ) ) {
+					continue;
+				}
+
+				$visibility = $field['visibility'] ?? null;
+				if ( ! is_array( $visibility ) || ! array_key_exists( 'value', $visibility ) ) {
+					continue;
+				}
+
+				$controller = $visibility['controller'] ?? null;
+				if ( ! is_string( $controller ) ) {
+					continue;
+				}
+
+				$type = $controller_types[ $controller ] ?? null;
+				if ( ! is_string( $type ) || ! in_array( $type, self::TYPED_VALUE_FIELD_TYPES, true ) ) {
+					continue;
+				}
+
+				$original  = $visibility['value'];
+				$canonical = self::canonicalize_typed_visibility_value( $original, $type, $controller );
+				if ( $original !== $canonical ) {
+					$field['visibility']['value'] = $canonical;
+					$converted_fields[]           = $field['id'];
+				}
+			}
+			unset( $field );
+		}
+		unset( $group );
+	}
+
+	/**
+	 * Canonicalize one visibility value or list of alternatives.
+	 *
+	 * @param mixed  $value Visibility value.
+	 * @param string $type Controller field type.
+	 * @param string $controller_id Controller field id.
+	 * @return mixed
+	 */
+	private static function canonicalize_typed_visibility_value( $value, string $type, string $controller_id ) {
+		if ( is_array( $value ) ) {
+			$canonical = array();
+			foreach ( $value as $key => $item ) {
+				$canonical[ $key ] = 'array' === $type && ! is_array( $item )
+					? $item
+					: self::canonicalize_typed_visibility_item( $item, $type, $controller_id );
+			}
+
+			return $canonical;
+		}
+
+		return self::canonicalize_typed_visibility_item( $value, $type, $controller_id );
+	}
+
+	/**
+	 * Canonicalize one typed visibility alternative when it is compatible.
+	 *
+	 * @param mixed  $value Visibility alternative.
+	 * @param string $type Controller field type.
+	 * @param string $controller_id Controller field id.
+	 * @return mixed
+	 */
+	private static function canonicalize_typed_visibility_item( $value, string $type, string $controller_id ) {
+		try {
+			switch ( $type ) {
+				case 'array':
+					return self::canonicalize_array_value( $value, $controller_id );
+				case 'checkbox':
+					return null === $value ? null : self::canonicalize_checkbox_value( $value, $controller_id );
+				case 'number':
+					return self::canonicalize_number( $value, false, $controller_id, 'visibility value' );
+				case 'integer':
+					return self::canonicalize_number( $value, true, $controller_id, 'visibility value' );
+				case 'datetime-local':
+					return self::canonicalize_datetime( $value, $controller_id );
+			}
+		} catch ( \InvalidArgumentException $e ) {
+			unset( $e );
+			// Preserve incompatible alternatives instead of narrowing the existing visibility contract.
+			return $value;
+		}
+
+		return $value;
 	}
 
 	/**
@@ -1369,9 +1474,9 @@ class SettingsUISchema {
 	/**
 	 * Get the raw value for a legacy field.
 	 *
-	 * Option-backed values are read only for legacy form-post fields. The field
-	 * name is the persistence source of truth and supports the same flat or
-	 * one-level nested shape as the classic form.
+	 * Option-backed values are read only for legacy form-post fields. The option
+	 * reader supports flat and one-level nested names. Deeper names use the field
+	 * id while the form name remains unchanged for saving.
 	 *
 	 * @param array $setting Legacy field definition.
 	 * @param array $save Field save metadata.
@@ -1399,7 +1504,11 @@ class SettingsUISchema {
 		}
 
 		if ( ! self::is_supported_form_post_name( $field_name, false ) ) {
-			throw self::invalid_schema( sprintf( 'Legacy form-post field "%s" may use only one bracketed setting name.', $field_name ) );
+			throw self::invalid_schema( sprintf( 'Legacy form-post field "%s" has an unsupported name.', $field_name ) );
+		}
+
+		if ( 1 < substr_count( $field_name, '[' ) ) {
+			return woocommerce_settings_get_option( (string) $setting['id'], $default );
 		}
 
 		return woocommerce_settings_get_option( $field_name, $default );
@@ -2109,7 +2218,7 @@ class SettingsUISchema {
 		}
 
 		$base_name = $is_array && '[]' === substr( $name, -2 ) ? substr( $name, 0, -2 ) : $name;
-		return 1 === preg_match( '/^[^\[\]]+(?:\[[^\[\]]+\])?$/', $base_name );
+		return 1 === preg_match( '/^[^\[\]]+(?:\[[^\[\]]+\])*$/', $base_name );
 	}
 
 	/**

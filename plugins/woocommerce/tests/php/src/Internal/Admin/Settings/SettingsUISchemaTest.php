@@ -1029,6 +1029,131 @@ class SettingsUISchemaTest extends WC_Unit_Test_Case {
 	}
 
 	/**
+	 * @testdox It canonicalizes visibility values with their typed controllers.
+	 */
+	public function test_canonicalize_schema_values_matches_typed_visibility_values(): void {
+		$this->setExpectedIncorrectUsage( SettingsUISchema::class . '::canonicalize_schema_values' );
+
+		$schema = SettingsUISchema::canonicalize_schema_values(
+			$this->get_native_schema_with_fields(
+				array(
+					array(
+						'id'    => 'acme_enabled',
+						'type'  => 'checkbox',
+						'value' => 'yes',
+						'save'  => array( 'adapter' => 'none' ),
+					),
+					array(
+						'id'         => 'acme_enabled_note',
+						'type'       => 'text',
+						'value'      => '',
+						'visibility' => array(
+							'controller' => 'acme_enabled',
+							'value'      => array( 'no', 'yes', 'maybe' ),
+						),
+						'save'       => array( 'adapter' => 'none' ),
+					),
+					array(
+						'id'    => 'acme_ratio',
+						'type'  => 'number',
+						'value' => '2.5',
+						'save'  => array( 'adapter' => 'none' ),
+					),
+					array(
+						'id'    => 'acme_count',
+						'type'  => 'integer',
+						'value' => '2',
+						'save'  => array( 'adapter' => 'none' ),
+					),
+					array(
+						'id'         => 'acme_count_note',
+						'type'       => 'text',
+						'value'      => '',
+						'visibility' => array(
+							'controller' => 'acme_count',
+							'value'      => array( '2', '2.5' ),
+						),
+						'save'       => array( 'adapter' => 'none' ),
+					),
+					array(
+						'id'    => 'acme_optional_ratio',
+						'type'  => 'number',
+						'value' => '',
+						'save'  => array( 'adapter' => 'none' ),
+					),
+					array(
+						'id'         => 'acme_optional_ratio_note',
+						'type'       => 'text',
+						'value'      => '',
+						'visibility' => array(
+							'controller' => 'acme_optional_ratio',
+							'value'      => '',
+						),
+						'save'       => array( 'adapter' => 'none' ),
+					),
+					array(
+						'id'         => 'acme_ratio_note',
+						'type'       => 'text',
+						'value'      => '',
+						'visibility' => array(
+							'controller' => 'acme_ratio',
+							'value'      => array( '1.5', '2.5' ),
+						),
+						'save'       => array( 'adapter' => 'none' ),
+					),
+					array(
+						'id'    => 'acme_start',
+						'type'  => 'datetime-local',
+						'value' => '2026-08-03T12:30Z',
+						'save'  => array( 'adapter' => 'none' ),
+					),
+					array(
+						'id'         => 'acme_start_note',
+						'type'       => 'text',
+						'value'      => '',
+						'visibility' => array(
+							'controller' => 'acme_start',
+							'value'      => '2026-08-03T12:30Z',
+						),
+						'save'       => array( 'adapter' => 'none' ),
+					),
+					array(
+						'id'    => 'acme_methods',
+						'type'  => 'array',
+						'value' => array( 1, 2 ),
+						'save'  => array( 'adapter' => 'none' ),
+					),
+					array(
+						'id'         => 'acme_methods_note',
+						'type'       => 'text',
+						'value'      => '',
+						'visibility' => array(
+							'controller' => 'acme_methods',
+							'value'      => array( array( 1, 2 ) ),
+						),
+						'save'       => array( 'adapter' => 'none' ),
+					),
+				)
+			)
+		);
+
+		$fields = array_column( $schema['groups']['main']['fields'], null, 'id' );
+
+		$this->assertSame( true, $fields['acme_enabled']['value'] );
+		$this->assertSame( array( false, true, 'maybe' ), $fields['acme_enabled_note']['visibility']['value'] );
+		$this->assertSame( 2.5, $fields['acme_ratio']['value'] );
+		$this->assertSame( array( 1.5, 2.5 ), $fields['acme_ratio_note']['visibility']['value'] );
+		$this->assertSame( 2, $fields['acme_count']['value'] );
+		$this->assertSame( array( 2, '2.5' ), $fields['acme_count_note']['visibility']['value'] );
+		$this->assertNull( $fields['acme_optional_ratio']['value'] );
+		$this->assertNull( $fields['acme_optional_ratio_note']['visibility']['value'] );
+		$this->assertSame( '2026-08-03T12:30:00+00:00', $fields['acme_start']['value'] );
+		$this->assertSame( '2026-08-03T12:30:00+00:00', $fields['acme_start_note']['visibility']['value'] );
+		$this->assertSame( array( '1', '2' ), $fields['acme_methods']['value'] );
+		$this->assertSame( array( array( '1', '2' ) ), $fields['acme_methods_note']['visibility']['value'] );
+	}
+
+	/**
 	 * @testdox It canonicalizes legacy values, numeric bounds, and original form representations atomically.
 	 */
 	public function test_from_legacy_settings_canonicalizes_typed_values_and_preserves_form_values(): void {
@@ -1588,25 +1713,65 @@ class SettingsUISchemaTest extends WC_Unit_Test_Case {
 	}
 
 	/**
-	 * @testdox It rejects deeper legacy form names rather than guessing an option path.
+	 * @testdox It preserves deep legacy form names with the previous option lookup.
 	 */
-	public function test_from_legacy_settings_rejects_deep_form_option_names(): void {
-		$this->expectException( \InvalidArgumentException::class );
-		$this->expectExceptionMessage( 'one bracketed setting name' );
+	public function test_from_legacy_settings_uses_field_id_for_deep_form_option_names(): void {
+		update_option( 'acme_quantity', '02' );
 
-		SettingsUISchema::from_legacy_settings(
-			'acme',
-			'',
-			'Acme',
-			array(
+		try {
+			$schema = SettingsUISchema::from_legacy_settings(
+				'acme',
+				'',
+				'Acme',
 				array(
-					'id'         => 'acme_quantity',
-					'field_name' => 'acme_settings[group][quantity]',
-					'label'      => 'Quantity',
-					'type'       => 'number',
-				),
-			)
-		);
+					array(
+						'id'         => 'acme_quantity',
+						'field_name' => 'acme_settings[group][quantity]',
+						'label'      => 'Quantity',
+						'type'       => 'number',
+					),
+				)
+			);
+		} finally {
+			delete_option( 'acme_quantity' );
+		}
+
+		$field = $schema['groups']['default']['fields'][0];
+		$this->assertSame( 2, $field['value'] );
+		$this->assertSame( 'acme_settings[group][quantity]', $field['save']['name'] );
+		$this->assertSame( '02', $field['save']['initialValue'] );
+		SettingsUISchema::assert_valid_schema( $schema );
+	}
+
+	/**
+	 * @testdox It preserves deep legacy array names with the field-id option lookup.
+	 */
+	public function test_from_legacy_settings_uses_field_id_for_deep_array_form_names(): void {
+		update_option( 'acme_methods', array( 'card', 'link' ) );
+
+		try {
+			$schema = SettingsUISchema::from_legacy_settings(
+				'acme',
+				'',
+				'Acme',
+				array(
+					array(
+						'id'         => 'acme_methods',
+						'field_name' => 'acme_settings[group][methods][]',
+						'label'      => 'Methods',
+						'type'       => 'multiselect',
+					),
+				)
+			);
+		} finally {
+			delete_option( 'acme_methods' );
+		}
+
+		$field = $schema['groups']['default']['fields'][0];
+		$this->assertSame( array( 'card', 'link' ), $field['value'] );
+		$this->assertSame( 'acme_settings[group][methods][]', $field['save']['name'] );
+		$this->assertSame( array( 'card', 'link' ), $field['save']['initialValue'] );
+		SettingsUISchema::assert_valid_schema( $schema );
 	}
 
 	/**
@@ -2133,7 +2298,7 @@ class SettingsUISchemaTest extends WC_Unit_Test_Case {
 	 */
 	public function test_assert_valid_schema_rejects_unsupported_form_post_names(): void {
 		$schema = self::get_valid_schema_for_validation();
-		$schema['groups']['main']['fields'][0]['save']['name'] = 'settings[group][quantity]';
+		$schema['groups']['main']['fields'][0]['save']['name'] = 'settings[group][quantity';
 
 		$this->expectException( \InvalidArgumentException::class );
 		$this->expectExceptionMessage( 'is not a supported form-post field name' );
