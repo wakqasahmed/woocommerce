@@ -63,20 +63,30 @@ const decimalStringsRepresentSameValue = ( left: string, right: string ) => {
 	);
 };
 
-export const areSettingsValuesEqual = (
-	left: SettingsValue,
-	right: SettingsValue
-) => {
-	if ( Array.isArray( left ) || Array.isArray( right ) ) {
+export const areValuesEqual = ( a: SettingsValue, b: SettingsValue ) => {
+	if ( Array.isArray( a ) || Array.isArray( b ) ) {
 		return (
-			Array.isArray( left ) &&
-			Array.isArray( right ) &&
-			left.length === right.length &&
-			left.every( ( value, index ) => value === right[ index ] )
+			Array.isArray( a ) &&
+			Array.isArray( b ) &&
+			a.length === b.length &&
+			a.every( ( value, index ) => value === b[ index ] )
 		);
 	}
 
-	return left === right;
+	return a === b;
+};
+
+export const valueMatchesVisibilityRule = (
+	value: SettingsValue,
+	expected: SettingsValue | SettingsValue[] | undefined
+) => {
+	const expectedValues = Array.isArray( expected )
+		? expected
+		: [ expected ?? true ];
+
+	return expectedValues.some( ( expectedValue ) =>
+		areValuesEqual( value, expectedValue )
+	);
 };
 
 export const toCanonicalNumberValue = (

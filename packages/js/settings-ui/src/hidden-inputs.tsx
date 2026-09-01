@@ -8,7 +8,7 @@ import { createElement, Fragment } from '@wordpress/element';
  */
 import { error } from './diagnostics';
 import type { SettingsUIField, SettingsValue } from './types';
-import { areSettingsValuesEqual, toStoreLocalDateTime } from './values';
+import { areValuesEqual, toStoreLocalDateTime } from './values';
 
 type HiddenInput = {
 	name: string;
@@ -138,7 +138,7 @@ export const getHiddenInputs = (
 		field.save &&
 		Object.prototype.hasOwnProperty.call( field.save, 'initialValue' ) &&
 		typeof initialCanonicalValue !== 'undefined' &&
-		areSettingsValuesEqual( value, initialCanonicalValue )
+		areValuesEqual( value, initialCanonicalValue )
 	) {
 		return serializeOriginalFormValue(
 			name,

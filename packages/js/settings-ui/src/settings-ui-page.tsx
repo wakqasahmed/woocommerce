@@ -43,7 +43,7 @@ import type {
 	SettingsValue,
 	SettingsValues,
 } from './types';
-import { areSettingsValuesEqual } from './values';
+import { areValuesEqual, valueMatchesVisibilityRule } from './values';
 
 type SaveNotice = {
 	status: 'success' | 'error';
@@ -79,7 +79,7 @@ const getChangedValues = (
 	const changedValues: Partial< SettingsValues > = {};
 
 	Object.keys( values ).forEach( ( key ) => {
-		if ( ! areSettingsValuesEqual( values[ key ], initialValues[ key ] ) ) {
+		if ( ! areValuesEqual( values[ key ], initialValues[ key ] ) ) {
 			changedValues[ key ] = values[ key ];
 		}
 	} );
@@ -265,19 +265,6 @@ const GroupHeader = ( { group }: { group: SettingsUIGroup } ) => {
 				</div>
 			) : null }
 		</header>
-	);
-};
-
-const valueMatchesVisibilityRule = (
-	value: SettingsValue,
-	expected: SettingsValue | SettingsValue[] | undefined
-) => {
-	const expectedValues = Array.isArray( expected )
-		? expected
-		: [ expected ?? true ];
-
-	return expectedValues.some( ( expectedValue ) =>
-		areSettingsValuesEqual( value, expectedValue )
 	);
 };
 
@@ -601,7 +588,7 @@ export const SettingsUIPage = ( {
 	const setValue = useCallback(
 		( fieldId: string, nextValue: SettingsValue ) => {
 			setValuesState( ( currentValues ) =>
-				areSettingsValuesEqual( currentValues[ fieldId ], nextValue )
+				areValuesEqual( currentValues[ fieldId ], nextValue )
 					? currentValues
 					: {
 							...currentValues,
