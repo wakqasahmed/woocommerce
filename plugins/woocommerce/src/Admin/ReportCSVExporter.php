@@ -151,12 +151,19 @@ class ReportCSVExporter extends \WC_CSV_Batch_Exporter {
 	/**
 	 * Delete this report export's body and headers.
 	 *
+	 * @param string|null $resolved_filename Exact filename after export filters, or null to use the current filename.
 	 * @return bool True when both files are absent after cleanup.
 	 *
 	 * @since 11.2.0
 	 */
-	public function delete_file() {
-		$paths = array( $this->get_file_path(), $this->get_headers_row_file_path() );
+	public function delete_file( $resolved_filename = null ) {
+		if ( null === $resolved_filename ) {
+			$file_path = $this->get_file_path();
+		} else {
+			$file_path = self::get_reports_directory() . sanitize_file_name( $resolved_filename );
+		}
+
+		$paths = array( $file_path, $file_path . '.headers' );
 
 		foreach ( $paths as $path ) {
 			if ( file_exists( $path ) ) {

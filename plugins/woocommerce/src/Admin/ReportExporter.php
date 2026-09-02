@@ -45,6 +45,11 @@ class ReportExporter {
 	private const EXPORT_RETENTION_PERIOD = 7 * DAY_IN_SECONDS;
 
 	/**
+	 * How often failed or missed cleanup attempts are retried.
+	 */
+	private const EXPORT_CLEANUP_RETRY_PERIOD = DAY_IN_SECONDS;
+
+	/**
 	 * Get all available scheduling actions.
 	 * Used to determine action hook names and clear events.
 	 *
@@ -132,7 +137,7 @@ class ReportExporter {
 		$percent_complete = $exporter->get_percent_complete();
 		self::update_export_percentage_complete( $report_type, $export_id, $percent_complete );
 		if ( 100 === $percent_complete ) {
-			self::schedule_export_cleanup( $report_type, $filename );
+			self::schedule_export_cleanup( $exporter->get_filename() );
 		}
 	}
 
@@ -185,17 +190,32 @@ class ReportExporter {
 	/**
 	 * Schedule cleanup for a completed report export.
 	 *
-	 * @param string $report_type Report type.
-	 * @param string $filename    Export filename.
+	 * @param string $filename Export filename after filters have been applied.
+	 * @param int    $delay    Delay before the first cleanup attempt.
 	 * @return void
 	 */
-	private static function schedule_export_cleanup( $report_type, $filename ) {
+	private static function schedule_export_cleanup( $filename, $delay = self::EXPORT_RETENTION_PERIOD ) {
 		$action_hook = self::get_action( 'cleanup_export' );
-		if ( is_string( $action_hook ) ) {
-			wp_schedule_single_event(
-				time() + self::EXPORT_RETENTION_PERIOD,
-				$action_hook,
-				array( $report_type, $filename )
+		if ( ! is_string( $action_hook ) ) {
+			return;
+		}
+
+		$action_args = array( $filename );
+		if ( wp_next_scheduled( $action_hook, $action_args ) ) {
+			return;
+		}
+
+		$timestamp = time() + $delay;
+		$scheduled = wp_schedule_event( $timestamp, 'daily', $action_hook, $action_args, true );
+		if ( true === $scheduled ) {
+			return;
+		}
+
+		$action_id = WC()->queue()->schedule_single( $timestamp, $action_hook, $action_args, (string) self::$group );
+		if ( ! $action_id ) {
+			wc_get_logger()->error(
+				sprintf( 'Unable to schedule cleanup for report export %s.', $filename ),
+				array( 'source' => 'report-exporter' )
 			);
 		}
 	}
@@ -203,22 +223,31 @@ class ReportExporter {
 	/**
 	 * Delete an expired report export.
 	 *
-	 * @param string $report_type Report type.
-	 * @param string $filename    Export filename.
+	 * @internal
+	 *
+	 * @since 11.2.0
+	 *
+	 * @param string $filename Export filename after filters have been applied.
 	 * @return void
 	 */
-	public static function cleanup_export( $report_type, $filename ) {
-		if ( ! is_string( $report_type ) || ! is_string( $filename ) ) {
+	public static function cleanup_export( $filename ) {
+		if ( ! is_string( $filename ) ) {
 			return;
 		}
 
-		$exporter = new ReportCSVExporter( $report_type );
-		$exporter->set_filename( $filename );
-		if ( ! $exporter->delete_file() ) {
+		$exporter = new ReportCSVExporter();
+		if ( ! $exporter->delete_file( $filename ) ) {
 			wc_get_logger()->warning(
 				sprintf( 'Unable to delete expired report export %s.', $filename ),
 				array( 'source' => 'report-exporter' )
 			);
+			self::schedule_export_cleanup( $filename, self::EXPORT_CLEANUP_RETRY_PERIOD );
+			return;
+		}
+
+		$action_hook = self::get_action( 'cleanup_export' );
+		if ( is_string( $action_hook ) ) {
+			wp_clear_scheduled_hook( $action_hook, array( $filename ) );
 		}
 	}
 
@@ -233,6 +262,9 @@ class ReportExporter {
 
 		$request_method = isset( $_SERVER['REQUEST_METHOD'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) : 'GET';
 		if ( 'GET' !== strtoupper( $request_method ) ) {
+			if ( ! headers_sent() ) {
+				header( 'Allow: GET' );
+			}
 			status_header( 405 );
 			return;
 		}

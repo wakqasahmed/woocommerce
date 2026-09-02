@@ -150,11 +150,13 @@ class WC_Admin_Tests_API_Reports_Export extends WC_REST_Unit_Test_Case {
 		// Run the pending export jobs.
 		WC_Helper_Queue::run_all_pending( 'wc-admin-data' );
 		$cleanup_hook = ReportExporter::get_action( 'cleanup_export' );
-		$cleanup_args = array( 'taxes', 'wc-taxes-report-export-' . $export['export_id'] );
+		$cleanup_args = array( 'wc-taxes-report-export-' . $export['export_id'] . '.csv' );
 		$this->assertIsString( $cleanup_hook );
-		$cleanup_time = wp_next_scheduled( $cleanup_hook, $cleanup_args );
-		$this->assertGreaterThanOrEqual( time() + WEEK_IN_SECONDS - 1, $cleanup_time );
-		$this->assertLessThanOrEqual( time() + WEEK_IN_SECONDS + 1, $cleanup_time );
+		$cleanup_event = wp_get_scheduled_event( $cleanup_hook, $cleanup_args );
+		$this->assertNotFalse( $cleanup_event );
+		$this->assertSame( 'daily', $cleanup_event->schedule );
+		$this->assertGreaterThanOrEqual( time() + WEEK_IN_SECONDS - 1, $cleanup_event->timestamp );
+		$this->assertLessThanOrEqual( time() + WEEK_IN_SECONDS + 1, $cleanup_event->timestamp );
 		wp_clear_scheduled_hook( $cleanup_hook, $cleanup_args );
 
 		// Check that the status shows 100% and includes a download url.

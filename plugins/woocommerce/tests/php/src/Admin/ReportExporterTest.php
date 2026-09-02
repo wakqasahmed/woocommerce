@@ -130,31 +130,62 @@ class ReportExporterTest extends WC_Unit_Test_Case {
 	}
 
 	/**
-	 * @testdox Should clean up the exact export using its report-specific filename filter.
+	 * @testdox Should clean up the resolved filename without running export filters again.
 	 */
-	public function test_cleanup_export_uses_report_filename_filter(): void {
-		$filename_filter = static function ( $filename ) {
-			return 'filtered-' . $filename;
+	public function test_cleanup_export_uses_resolved_filename_without_rerunning_filters(): void {
+		$filter_called   = false;
+		$filename_filter = static function ( $filename ) use ( &$filter_called ) {
+			$filter_called = true;
+			return 'changed-' . $filename;
 		};
-		add_filter( 'woocommerce_admin_orders_report_export_get_filename', $filename_filter );
-		$filename = 'wc-orders-report-export-' . wp_generate_uuid4();
+		add_filter( 'woocommerce__export_get_filename', $filename_filter );
+		$filename      = 'filtered-wc-orders-report-export-' . wp_generate_uuid4() . '.csv';
+		$body          = ReportCSVExporter::get_reports_directory() . $filename;
+		$headers       = $body . '.headers';
+		$this->files[] = $body;
+		$this->files[] = $headers;
 
 		try {
-			$exporter = new ReportCSVExporter( 'orders' );
-			$exporter->set_filename( $filename );
-			$body          = ReportCSVExporter::get_reports_directory() . $exporter->get_filename();
-			$headers       = $body . '.headers';
-			$this->files[] = $body;
-			$this->files[] = $headers;
 			file_put_contents( $body, 'body' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Creating an export fixture.
 			file_put_contents( $headers, 'headers' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Creating an export fixture.
 
-			ReportExporter::cleanup_export( 'orders', $filename );
+			ReportExporter::cleanup_export( $filename );
 
-			$this->assertFileDoesNotExist( $body, 'Cleanup should remove the filtered export body.' );
-			$this->assertFileDoesNotExist( $headers, 'Cleanup should remove the filtered export headers.' );
+			$this->assertFalse( $filter_called, 'Cleanup should not resolve the filename through live filters.' );
+			$this->assertFileDoesNotExist( $body, 'Cleanup should remove the resolved export body.' );
+			$this->assertFileDoesNotExist( $headers, 'Cleanup should remove the resolved export headers.' );
 		} finally {
-			remove_filter( 'woocommerce_admin_orders_report_export_get_filename', $filename_filter );
+			remove_filter( 'woocommerce__export_get_filename', $filename_filter );
+		}
+	}
+
+	/**
+	 * @testdox Should retry cleanup when deleting an export fails.
+	 */
+	public function test_cleanup_export_retries_after_delete_failure(): void {
+		$paths           = $this->create_export_files();
+		$filename        = basename( $paths['body'] );
+		$cleanup_hook    = ReportExporter::get_action( 'cleanup_export' );
+		$cleanup_args    = array( $filename );
+		$redirect_delete = static function ( $path ) {
+			return $path . '.blocked';
+		};
+		$this->assertIsString( $cleanup_hook );
+		add_filter( 'wp_delete_file', $redirect_delete );
+
+		try {
+			ReportExporter::cleanup_export( $filename );
+
+			$this->assertFileExists( $paths['body'], 'A failed cleanup should retain the export body.' );
+			$this->assertFileExists( $paths['headers'], 'A failed cleanup should retain the export headers.' );
+			$cleanup_event = wp_get_scheduled_event( $cleanup_hook, $cleanup_args );
+			$this->assertNotFalse( $cleanup_event, 'A failed cleanup should schedule another attempt.' );
+			$this->assertSame( 'daily', $cleanup_event->schedule, 'Cleanup should keep retrying until deletion succeeds.' );
+			$this->assertGreaterThanOrEqual( time() + DAY_IN_SECONDS - 1, $cleanup_event->timestamp );
+			$this->assertLessThanOrEqual( time() + DAY_IN_SECONDS + 1, $cleanup_event->timestamp );
+		} finally {
+			remove_filter( 'wp_delete_file', $redirect_delete );
+			wp_clear_scheduled_hook( $cleanup_hook, $cleanup_args );
 		}
 	}
 
