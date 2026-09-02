@@ -30,7 +30,6 @@ use Automattic\WooCommerce\Internal\Admin\Marketing\MarketingSpecs;
 use Automattic\WooCommerce\Internal\Admin\Notes\WooSubscriptionsNotes;
 use Automattic\WooCommerce\Internal\AssignDefaultCategory;
 use Automattic\WooCommerce\Internal\DataStores\Orders\CustomOrdersTableController;
-use Automattic\WooCommerce\Utilities\OrderUtil;
 use Automattic\WooCommerce\Internal\DataStores\Orders\DataSynchronizer;
 use Automattic\WooCommerce\Internal\DataStores\Orders\OrdersTableDataStore;
 use Automattic\WooCommerce\Internal\EmailEditor\WCTransactionalEmails\WCEmailPostsCleanup;
@@ -45,6 +44,7 @@ use Automattic\WooCommerce\Internal\Utilities\DatabaseUtil;
 use Automattic\WooCommerce\Internal\Utilities\FilesystemUtil;
 use Automattic\WooCommerce\Internal\Utilities\ProductUtil;
 use Automattic\WooCommerce\Internal\VariationGallery\Package as VariationGalleryPackage;
+use Automattic\WooCommerce\Utilities\OrderUtil;
 use Automattic\WooCommerce\Utilities\StringUtil;
 use Automattic\WooCommerce\Blocks\Options as BlockOptions;
 use Automattic\WooCommerce\Blocks\Utils\BlockTemplateUtils;
@@ -3714,6 +3714,9 @@ function wc_update_1120_migrate_stock_notifications_alpha_constant() {
  * now fall back to the order type for such rows; resetting the marker keeps them on the cheap path
  * and restores the Orders report fallback to the refunded order's value.
  *
+ * Batches walk the table by order ID. A database error stops the migration and is logged instead
+ * of retried, because the report queries stay correct without the reset.
+ *
  * @since 11.2.0
  *
  * @return bool True to run again for the next batch, false when completed.
@@ -3721,6 +3724,7 @@ function wc_update_1120_migrate_stock_notifications_alpha_constant() {
 function wc_update_1120_reset_refund_returning_customer_markers() {
 	global $wpdb;
 
+	$last_id_option    = 'woocommerce_update_1120_last_refund_order_id';
 	$order_stats_table = $wpdb->prefix . 'wc_order_stats';
 	$orders_table      = OrderUtil::get_table_for_orders();
 	$hpos_enabled      = OrderUtil::custom_orders_table_usage_is_enabled();
@@ -3729,25 +3733,39 @@ function wc_update_1120_reset_refund_returning_customer_markers() {
 
 	// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- Table and column names cannot be prepared.
 	$refund_ids = $wpdb->get_col(
-		"SELECT stats.order_id FROM {$order_stats_table} AS stats
-		INNER JOIN {$orders_table} AS orders ON orders.{$order_id_column} = stats.order_id
-		WHERE stats.returning_customer IS NOT NULL AND orders.{$order_type_column} = 'shop_order_refund'
-		LIMIT 250"
+		$wpdb->prepare(
+			"SELECT stats.order_id FROM {$order_stats_table} AS stats
+			INNER JOIN {$orders_table} AS orders ON orders.{$order_id_column} = stats.order_id
+			WHERE stats.order_id > %d AND stats.returning_customer IS NOT NULL AND orders.{$order_type_column} = 'shop_order_refund'
+			ORDER BY stats.order_id ASC
+			LIMIT 250",
+			(int) get_option( $last_id_option, 0 )
+		)
 	);
 	// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
-	if ( ! empty( $refund_ids ) ) {
+	if ( '' === $wpdb->last_error && ! empty( $refund_ids ) ) {
+		$refund_ids      = array_map( 'intval', $refund_ids );
 		$id_placeholders = implode( ', ', array_fill( 0, count( $refund_ids ), '%d' ) );
 		$updated         = $wpdb->query(
 			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- Table name cannot be prepared; placeholders are generated per ID.
 			$wpdb->prepare( "UPDATE {$order_stats_table} SET returning_customer = NULL WHERE order_id IN ( {$id_placeholders} )", $refund_ids )
 		);
 
-		if ( $updated ) {
+		if ( false !== $updated ) {
+			update_option( $last_id_option, end( $refund_ids ), false );
 			return true;
 		}
 	}
 
+	if ( '' !== $wpdb->last_error ) {
+		wc_get_logger()->error(
+			sprintf( 'Stopped resetting refund returning-customer markers: %s', $wpdb->last_error ),
+			array( 'source' => 'wc_update_1120_reset_refund_returning_customer_markers' )
+		);
+	}
+
+	delete_option( $last_id_option );
 	ReportsCache::invalidate();
 
 	return false;
