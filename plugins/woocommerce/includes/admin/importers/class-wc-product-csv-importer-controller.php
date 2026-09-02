@@ -366,6 +366,11 @@ class WC_Product_CSV_Importer_Controller {
 			$has_more = count( $post_ids ) > $remaining_batch_size;
 			$post_ids = array_slice( $post_ids, 0, $remaining_batch_size );
 
+			if ( ! empty( $post_ids ) ) {
+				// Prime caches to reduce future queries.
+				_prime_post_caches( $post_ids );
+			}
+
 			foreach ( $post_ids as $post_id ) {
 				$post = get_post( $post_id );
 
