@@ -116,6 +116,57 @@ class ReportCSVExporter extends \WC_CSV_Batch_Exporter {
 		return self::get_reports_directory() . $this->get_filename();
 	}
 
+	/**
+	 * Send a complete report export without deleting it.
+	 *
+	 * @return bool True when both export parts were sent, false when either part is unavailable.
+	 *
+	 * @since 11.2.0
+	 */
+	public function send_file() {
+		$headers_handle = @fopen( $this->get_headers_row_file_path(), 'rb' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- The export can expire or be deleted between validation and opening it.
+		if ( false === $headers_handle ) {
+			return false;
+		}
+
+		$file_handle = @fopen( $this->get_file_path(), 'rb' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- The export can expire or be deleted between validation and opening it.
+		if ( false === $file_handle ) {
+			fclose( $headers_handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+			return false;
+		}
+
+		$this->send_headers();
+
+		try {
+			$headers_sent = false !== fpassthru( $headers_handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fpassthru, WordPress.Security.EscapeOutput.OutputNotEscaped -- Streaming a generated CSV download.
+			$file_sent    = false !== fpassthru( $file_handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fpassthru, WordPress.Security.EscapeOutput.OutputNotEscaped -- Streaming a generated CSV download.
+		} finally {
+			fclose( $headers_handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+			fclose( $file_handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+		}
+
+		return $headers_sent && $file_sent;
+	}
+
+	/**
+	 * Delete this report export's body and headers.
+	 *
+	 * @return bool True when both files are absent after cleanup.
+	 *
+	 * @since 11.2.0
+	 */
+	public function delete_file() {
+		$paths = array( $this->get_file_path(), $this->get_headers_row_file_path() );
+
+		foreach ( $paths as $path ) {
+			if ( file_exists( $path ) ) {
+				wp_delete_file( $path );
+			}
+		}
+
+		return ! file_exists( $paths[0] ) && ! file_exists( $paths[1] );
+	}
+
 
 	/**
 	 * Setter for report type.
