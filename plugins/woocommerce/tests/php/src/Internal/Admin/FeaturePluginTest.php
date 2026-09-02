@@ -3,6 +3,7 @@ declare( strict_types = 1 );
 
 namespace Automattic\WooCommerce\Tests\Internal\Admin;
 
+use Automattic\WooCommerce\Admin\ReportExporter;
 use Automattic\WooCommerce\Internal\Admin\Analytics;
 use Automattic\WooCommerce\Internal\Admin\FeaturePlugin;
 use Automattic\WooCommerce\Internal\Features\FeaturesController;
@@ -140,6 +141,23 @@ class FeaturePluginTest extends WC_Unit_Test_Case {
 		}
 
 		$this->assertSame( 0, $translation_count, 'The bootstrap gate should not translate WooCommerce feature definitions.' );
+	}
+
+	/**
+	 * @testdox Report export cleanup remains registered when Analytics is disabled.
+	 * @runInSeparateProcess
+	 * @preserveGlobalState disabled
+	 */
+	public function test_report_export_cleanup_is_initialized_when_analytics_is_disabled(): void {
+		$hook     = ReportExporter::get_action( 'cleanup_export' );
+		$callback = array( ReportExporter::class, 'do_action_or_reschedule' );
+		$this->assertIsString( $hook, 'The cleanup hook should be defined.' );
+		remove_action( $hook, $callback, 10 );
+		update_option( Analytics::TOGGLE_OPTION_NAME, 'no' );
+
+		FeaturePlugin::instance()->includes();
+
+		$this->assertSame( 10, has_action( $hook, $callback ), 'Disabling Analytics should not disable cleanup for retained exports.' );
 	}
 
 	/**

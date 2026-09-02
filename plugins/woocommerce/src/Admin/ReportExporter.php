@@ -40,6 +40,11 @@ class ReportExporter {
 	const DOWNLOAD_EXPORT_ACTION = 'woocommerce_admin_download_report_csv';
 
 	/**
+	 * How long generated report exports remain available.
+	 */
+	private const EXPORT_RETENTION_PERIOD = 7 * DAY_IN_SECONDS;
+
+	/**
 	 * Get all available scheduling actions.
 	 * Used to determine action hook names and clear events.
 	 *
@@ -49,6 +54,7 @@ class ReportExporter {
 		return array(
 			'export_report'              => 'woocommerce_admin_report_export',
 			'email_report_download_link' => 'woocommerce_admin_email_report_download_link',
+			'cleanup_export'             => 'woocommerce_admin_report_export_cleanup',
 		);
 	}
 
@@ -118,11 +124,16 @@ class ReportExporter {
 	public static function export_report( $page_number, $export_id, $report_type, $report_args ) {
 		$report_args['page'] = $page_number;
 
+		$filename = "wc-{$report_type}-report-export-{$export_id}";
 		$exporter = new ReportCSVExporter( $report_type, $report_args );
-		$exporter->set_filename( "wc-{$report_type}-report-export-{$export_id}" );
+		$exporter->set_filename( $filename );
 		$exporter->generate_file();
 
-		self::update_export_percentage_complete( $report_type, $export_id, $exporter->get_percent_complete() );
+		$percent_complete = $exporter->get_percent_complete();
+		self::update_export_percentage_complete( $report_type, $export_id, $percent_complete );
+		if ( 100 === $percent_complete ) {
+			self::schedule_export_cleanup( $report_type, $filename );
+		}
 	}
 
 	/**
@@ -172,21 +183,72 @@ class ReportExporter {
 	}
 
 	/**
+	 * Schedule cleanup for a completed report export.
+	 *
+	 * @param string $report_type Report type.
+	 * @param string $filename    Export filename.
+	 * @return void
+	 */
+	private static function schedule_export_cleanup( $report_type, $filename ) {
+		$action_hook = self::get_action( 'cleanup_export' );
+		if ( is_string( $action_hook ) ) {
+			wp_schedule_single_event(
+				time() + self::EXPORT_RETENTION_PERIOD,
+				$action_hook,
+				array( $report_type, $filename )
+			);
+		}
+	}
+
+	/**
+	 * Delete an expired report export.
+	 *
+	 * @param string $report_type Report type.
+	 * @param string $filename    Export filename.
+	 * @return void
+	 */
+	public static function cleanup_export( $report_type, $filename ) {
+		if ( ! is_string( $report_type ) || ! is_string( $filename ) ) {
+			return;
+		}
+
+		$exporter = new ReportCSVExporter( $report_type );
+		$exporter->set_filename( $filename );
+		if ( ! $exporter->delete_file() ) {
+			wc_get_logger()->warning(
+				sprintf( 'Unable to delete expired report export %s.', $filename ),
+				array( 'source' => 'report-exporter' )
+			);
+		}
+	}
+
+	/**
 	 * Serve the export file.
 	 */
 	public static function download_export_file() {
-		// @todo - add nonce? (nonces are good for 24 hours)
-		if (
-			isset( $_GET['action'] ) &&
-			! empty( $_GET['filename'] ) &&
-			is_string( $_GET['filename'] ) && // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Download of a report file generated for the requesting user and deleted once served; gated on the view_woocommerce_reports capability, so a nonce would only prevent nuisance CSRF.
-			self::DOWNLOAD_EXPORT_ACTION === wp_unslash( $_GET['action'] ) && // phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Download of a report file generated for the requesting user and deleted once served; gated on the view_woocommerce_reports capability, so a nonce would only prevent nuisance CSRF. The value is only compared verbatim against a fixed action name.
-			current_user_can( 'view_woocommerce_reports' )
-		) {
-			$exporter = new ReportCSVExporter();
-			$exporter->set_filename( wp_unslash( $_GET['filename'] ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Download of a report file generated for the requesting user and deleted once served; gated on the view_woocommerce_reports capability, so a nonce would only prevent nuisance CSRF. set_filename() applies sanitize_file_name(), which keeps the path inside the reports directory.
-			$exporter->export();
+		$action = isset( $_GET['action'] ) && is_string( $_GET['action'] ) ? wp_unslash( $_GET['action'] ) : null; // phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- The value is only compared verbatim with a fixed action name.
+		if ( self::DOWNLOAD_EXPORT_ACTION !== $action ) {
+			return;
 		}
+
+		$request_method = isset( $_SERVER['REQUEST_METHOD'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) : 'GET';
+		if ( 'GET' !== strtoupper( $request_method ) ) {
+			status_header( 405 );
+			return;
+		}
+
+		if ( ! current_user_can( 'view_woocommerce_reports' ) || empty( $_GET['filename'] ) || ! is_string( $_GET['filename'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Report downloads are capability-gated.
+			return;
+		}
+
+		$exporter = new ReportCSVExporter();
+		$exporter->set_filename( wp_unslash( $_GET['filename'] ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- set_filename() sanitizes the filename and keeps it inside the reports directory.
+		if ( ! $exporter->send_file() ) {
+			status_header( 404 );
+			return;
+		}
+
+		exit;
 	}
 
 	/**

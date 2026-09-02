@@ -6,6 +6,7 @@
  * @since 3.5.0
  */
 
+use Automattic\WooCommerce\Admin\ReportExporter;
 use Automattic\WooCommerce\Enums\OrderStatus;
 
 /**
@@ -148,6 +149,13 @@ class WC_Admin_Tests_API_Reports_Export extends WC_REST_Unit_Test_Case {
 
 		// Run the pending export jobs.
 		WC_Helper_Queue::run_all_pending( 'wc-admin-data' );
+		$cleanup_hook = ReportExporter::get_action( 'cleanup_export' );
+		$cleanup_args = array( 'taxes', 'wc-taxes-report-export-' . $export['export_id'] );
+		$this->assertIsString( $cleanup_hook );
+		$cleanup_time = wp_next_scheduled( $cleanup_hook, $cleanup_args );
+		$this->assertGreaterThanOrEqual( time() + WEEK_IN_SECONDS - 1, $cleanup_time );
+		$this->assertLessThanOrEqual( time() + WEEK_IN_SECONDS + 1, $cleanup_time );
+		wp_clear_scheduled_hook( $cleanup_hook, $cleanup_args );
 
 		// Check that the status shows 100% and includes a download url.
 		$response = $this->server->dispatch( new WP_REST_Request( 'GET', $status_route ) );
