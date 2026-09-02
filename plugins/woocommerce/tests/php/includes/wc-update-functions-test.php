@@ -534,6 +534,17 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 	public function test_wc_update_1120_recalculate_product_permalink_verbose_page_rules_uses_site_locale(): void {
 		include_once WC_ABSPATH . 'includes/wc-update-functions.php';
 
+		set_current_screen( 'dashboard' );
+		$user_id = self::factory()->user->create(
+			array(
+				'role'   => 'administrator',
+				'locale' => 'fr_FR',
+			)
+		);
+		wp_set_current_user( $user_id );
+		$this->assertSame( 'en_US', get_locale(), 'The site locale should remain English.' );
+		$this->assertSame( 'fr_FR', determine_locale(), 'The admin request should use the current user locale.' );
+
 		$site_shop_page_id    = self::factory()->post->create(
 			array(
 				'post_type'   => 'page',
@@ -564,13 +575,41 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 		};
 		add_filter( 'woocommerce_get_shop_page_id', $filter_shop_page );
 
+		wc_update_1120_recalculate_product_permalink_verbose_page_rules();
+
+		$this->assertTrue( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
+		$this->assertSame( 'fr_FR', determine_locale(), 'The migration should restore the admin request locale.' );
+		$this->assertFalse( has_filter( 'plugin_locale', 'get_locale' ), 'The site-locale filter should be removed after the migration.' );
+	}
+
+	/**
+	 * @testdox Permalink migration leaves a caller-owned site locale switch active.
+	 */
+	public function test_wc_update_1120_recalculate_product_permalink_verbose_page_rules_preserves_locale_switch(): void {
+		include_once WC_ABSPATH . 'includes/wc-update-functions.php';
+
+		set_current_screen( 'dashboard' );
+		$user_id = self::factory()->user->create(
+			array(
+				'role'   => 'administrator',
+				'locale' => 'fr_FR',
+			)
+		);
+		wp_set_current_user( $user_id );
+		$this->assertSame( 'fr_FR', determine_locale(), 'The admin request should start in the user locale.' );
+
+		wc_switch_to_site_locale();
 		try {
+			$this->assertSame( 'en_US', determine_locale(), 'The caller should switch to the site locale.' );
+
 			wc_update_1120_recalculate_product_permalink_verbose_page_rules();
 
-			$this->assertTrue( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
-			$this->assertFalse( has_filter( 'plugin_locale', 'get_locale' ), 'The site-locale filter should be removed after the migration.' );
+			$this->assertSame( 'en_US', determine_locale(), 'The migration should not restore a locale switch it did not create.' );
+			$this->assertNotFalse( has_filter( 'plugin_locale', 'get_locale' ), 'The caller-owned site-locale filter should remain active.' );
 		} finally {
-			remove_filter( 'woocommerce_get_shop_page_id', $filter_shop_page );
+			wc_restore_locale();
 		}
+
+		$this->assertSame( 'fr_FR', determine_locale(), 'The caller should be able to restore its locale switch.' );
 	}
 }
