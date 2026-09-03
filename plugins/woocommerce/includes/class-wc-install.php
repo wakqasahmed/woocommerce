@@ -353,7 +353,7 @@ class WC_Install {
 		'11.2.0'   => array(
 			'wc_update_1120_remove_abandoned_cart_recovery',
 			'wc_update_1120_migrate_stock_notifications_alpha_constant',
-			'wc_update_1120_recalculate_product_permalink_verbose_page_rules',
+			'WC_Install::recalculate_product_permalink_verbose_page_rules',
 		),
 	);
 
@@ -971,6 +971,47 @@ class WC_Install {
 	 */
 	private static function update_wc_version() {
 		update_option( 'woocommerce_version', WC()->version );
+	}
+
+	/**
+	 * Recalculate whether product permalinks need verbose Shop page rewrite rules.
+	 *
+	 * @internal
+	 *
+	 * @return void
+	 *
+	 * @since 11.2.0
+	 */
+	public static function recalculate_product_permalink_verbose_page_rules(): void {
+		$permalinks   = (array) get_option( 'woocommerce_permalinks', array() );
+		$product_base = $permalinks['product_base'] ?? '';
+		$product_base = is_string( $product_base ) ? trim( rawurldecode( $product_base ), '/' ) : '';
+
+		$should_switch_locale = get_locale() !== determine_locale();
+		if ( $should_switch_locale ) {
+			wc_switch_to_site_locale();
+		}
+
+		try {
+			$shop_page_id = wc_get_page_id( 'shop' );
+			$shop_page    = $shop_page_id > 0 ? get_post( $shop_page_id ) : null;
+			$shop_base    = $shop_page instanceof WP_Post && 'page' === $shop_page->post_type ? trim( rawurldecode( (string) get_page_uri( $shop_page_id ) ), '/' ) : '';
+		} finally {
+			if ( $should_switch_locale ) {
+				wc_restore_locale();
+			}
+		}
+
+		$current_value          = ! empty( $permalinks['use_verbose_page_rules'] );
+		$use_verbose_page_rules = '' !== $shop_base && ( $shop_base === $product_base || 0 === strpos( $product_base, $shop_base . '/' ) );
+
+		if ( $current_value === $use_verbose_page_rules ) {
+			return;
+		}
+
+		$permalinks['use_verbose_page_rules'] = $use_verbose_page_rules;
+		update_option( 'woocommerce_permalinks', $permalinks );
+		update_option( 'woocommerce_queue_flush_rewrite_rules', 'yes' );
 	}
 
 	/**

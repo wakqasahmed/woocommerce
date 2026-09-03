@@ -477,7 +477,7 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 
 		$db_updates = WC_Install::get_db_update_callbacks();
 		$this->assertArrayHasKey( '11.2.0', $db_updates );
-		$this->assertContains( 'wc_update_1120_recalculate_product_permalink_verbose_page_rules', $db_updates['11.2.0'] );
+		$this->assertContains( 'WC_Install::recalculate_product_permalink_verbose_page_rules', $db_updates['11.2.0'] );
 
 		$shop_page_id = self::factory()->post->create(
 			array(
@@ -497,7 +497,7 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 		update_option( 'woocommerce_permalinks', $permalinks );
 		delete_option( 'woocommerce_queue_flush_rewrite_rules' );
 
-		wc_update_1120_recalculate_product_permalink_verbose_page_rules();
+		WC_Install::recalculate_product_permalink_verbose_page_rules();
 
 		$permalinks = get_option( 'woocommerce_permalinks' );
 		$this->assertFalse( $permalinks['use_verbose_page_rules'] );
@@ -505,14 +505,14 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 		$this->assertSame( 'yes', get_option( 'woocommerce_queue_flush_rewrite_rules' ) );
 
 		delete_option( 'woocommerce_queue_flush_rewrite_rules' );
-		wc_update_1120_recalculate_product_permalink_verbose_page_rules();
+		WC_Install::recalculate_product_permalink_verbose_page_rules();
 		$this->assertFalse( get_option( 'woocommerce_queue_flush_rewrite_rules', false ), 'An unchanged value should not queue another rewrite flush.' );
 
 		$permalinks['product_base']           = '/shop/%product_cat%';
 		$permalinks['use_verbose_page_rules'] = false;
 		update_option( 'woocommerce_permalinks', $permalinks );
 
-		wc_update_1120_recalculate_product_permalink_verbose_page_rules();
+		WC_Install::recalculate_product_permalink_verbose_page_rules();
 
 		$this->assertTrue( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
 		$this->assertSame( 'yes', get_option( 'woocommerce_queue_flush_rewrite_rules' ) );
@@ -522,7 +522,7 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 		$permalinks['use_verbose_page_rules'] = true;
 		update_option( 'woocommerce_permalinks', $permalinks );
 
-		wc_update_1120_recalculate_product_permalink_verbose_page_rules();
+		WC_Install::recalculate_product_permalink_verbose_page_rules();
 
 		$this->assertFalse( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
 		$this->assertSame( 'yes', get_option( 'woocommerce_queue_flush_rewrite_rules' ) );
@@ -575,7 +575,7 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 		};
 		add_filter( 'woocommerce_get_shop_page_id', $filter_shop_page );
 
-		wc_update_1120_recalculate_product_permalink_verbose_page_rules();
+		WC_Install::recalculate_product_permalink_verbose_page_rules();
 
 		$this->assertTrue( get_option( 'woocommerce_permalinks' )['use_verbose_page_rules'] );
 		$this->assertSame( 'fr_FR', determine_locale(), 'The migration should restore the admin request locale.' );
@@ -602,7 +602,7 @@ class WC_Update_Functions_Test extends \WC_Unit_Test_Case {
 		try {
 			$this->assertSame( 'en_US', determine_locale(), 'The caller should switch to the site locale.' );
 
-			wc_update_1120_recalculate_product_permalink_verbose_page_rules();
+			WC_Install::recalculate_product_permalink_verbose_page_rules();
 
 			$this->assertSame( 'en_US', determine_locale(), 'The migration should not restore a locale switch it did not create.' );
 			$this->assertNotFalse( has_filter( 'plugin_locale', 'get_locale' ), 'The caller-owned site-locale filter should remain active.' );
