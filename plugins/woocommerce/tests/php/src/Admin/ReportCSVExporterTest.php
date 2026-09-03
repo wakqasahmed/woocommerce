@@ -44,6 +44,7 @@ class ReportCSVExporterTest extends WC_Unit_Test_Case {
 	public function setUp(): void {
 		parent::setUp();
 
+		ReportCSVExporter::maybe_create_directory();
 		$this->filename     = 'wc-orders-report-export-' . wp_generate_uuid4();
 		$this->file_path    = ReportCSVExporter::get_reports_directory() . sanitize_file_name( $this->filename . '.csv' );
 		$this->headers_path = $this->file_path . '.headers';
@@ -107,6 +108,39 @@ class ReportCSVExporterTest extends WC_Unit_Test_Case {
 		$this->assertSame( '', $output, 'An incomplete export should not emit partial content.' );
 		$this->assertFileExists( $existing_path, 'The existing part should not be consumed.' );
 		$this->assertFileDoesNotExist( $missing_path, 'The missing part should not be created as an empty file.' );
+	}
+
+	/**
+	 * @testdox Should remove stale headers when restarting an export.
+	 */
+	public function test_first_batch_removes_stale_headers(): void {
+		file_put_contents( $this->headers_path, "old-column\n" ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Creating a stale export fixture.
+		file_put_contents( $this->file_path, "old-value\n" ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Creating a stale export fixture.
+
+		$exporter = new class() extends ReportCSVExporter {
+			/**
+			 * Prepare a partial first batch.
+			 */
+			public function prepare_data_to_export() {
+				$this->total_rows = 2;
+				$this->row_data   = array( array( 'value' => 'new-value' ) );
+			}
+		};
+		$exporter->set_filename( $this->filename );
+		$exporter->set_column_names( array( 'value' => 'value' ) );
+		$exporter->set_limit( 1 );
+
+		$exporter->generate_file();
+
+		$this->assertStringContainsString( 'new-value', (string) file_get_contents( $this->file_path ) ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents -- Reading the generated export fixture.
+		$this->assertFileDoesNotExist( $this->headers_path, 'A partial replacement export should not retain headers from the previous export.' );
+
+		ob_start();
+		$result = $this->send_file( $exporter );
+		$output = ob_get_clean();
+
+		$this->assertFalse( $result, 'A partial replacement export should not be downloadable.' );
+		$this->assertSame( '', $output, 'A partial replacement export should not emit stale content.' );
 	}
 
 	/**

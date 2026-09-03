@@ -28,6 +28,15 @@ wp_clear_scheduled_hook( 'generate_category_lookup_table' );
 wp_clear_scheduled_hook( 'wc_admin_unsnooze_admin_notes' );
 wp_unschedule_hook( 'woocommerce_admin_report_export_cleanup' );
 
+// WooCommerce is normally inactive when WordPress includes this file directly.
+if ( ! class_exists( 'ActionScheduler', false ) ) {
+	$wc_action_scheduler_bootstrap = __DIR__ . '/packages/action-scheduler/action-scheduler.php';
+	if ( is_readable( $wc_action_scheduler_bootstrap ) ) {
+		require_once $wc_action_scheduler_bootstrap;
+	}
+	unset( $wc_action_scheduler_bootstrap );
+}
+
 if ( class_exists( ActionScheduler::class ) && ActionScheduler::is_initialized() && function_exists( 'as_unschedule_all_actions' ) ) {
 	as_unschedule_all_actions( 'woocommerce_scheduled_sales' );
 	as_unschedule_all_actions( 'woocommerce_cancel_unpaid_orders' );

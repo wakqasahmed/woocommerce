@@ -112,6 +112,9 @@ abstract class WC_CSV_Batch_Exporter extends WC_CSV_Exporter {
 			if ( file_exists( $this->get_file_path() ) ) {
 				wp_delete_file( $this->get_file_path() );
 			}
+			if ( file_exists( $this->get_headers_row_file_path() ) || is_link( $this->get_headers_row_file_path() ) ) {
+				wp_delete_file( $this->get_headers_row_file_path() );
+			}
 
 			// We need to initialize the file here.
 			$this->get_file();

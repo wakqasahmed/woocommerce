@@ -174,6 +174,7 @@ class ReportExporter {
 				);
 				throw new \RuntimeException( 'A completed report export could not be scheduled for cleanup or removed.' );
 			}
+			self::delete_export_status( $report_type, $export_id );
 			return;
 		}
 
@@ -206,6 +207,23 @@ class ReportExporter {
 		$exports_status[ $status_key ] = $percentage;
 
 		update_option( self::EXPORT_STATUS_OPTION, $exports_status );
+	}
+
+	/**
+	 * Remove the status of an export that is no longer available.
+	 *
+	 * @param string $report_type Report type. E.g. 'customers'.
+	 * @param string $export_id Unique ID for report (timestamp expected).
+	 * @return void
+	 */
+	private static function delete_export_status( $report_type, $export_id ) {
+		$exports_status = get_option( self::EXPORT_STATUS_OPTION, array() );
+		$status_key     = self::get_status_key( $report_type, $export_id );
+
+		if ( array_key_exists( $status_key, $exports_status ) ) {
+			unset( $exports_status[ $status_key ] );
+			update_option( self::EXPORT_STATUS_OPTION, $exports_status );
+		}
 	}
 
 	/**
@@ -331,7 +349,7 @@ class ReportExporter {
 	 * Get the time after which both parts of an export may be removed.
 	 *
 	 * @param array{body: string, headers: string} $paths Export paths.
-	 * @return int|false Expiration timestamp, or false when both files are absent.
+	 * @return int|false|null Expiration timestamp, false when both files are absent, or null when a timestamp is unavailable.
 	 */
 	private static function get_export_expiration( $paths ) {
 		$latest_modified = false;
@@ -342,9 +360,10 @@ class ReportExporter {
 			}
 
 			$modified = @filemtime( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- A file can be deleted between the existence and timestamp checks.
-			if ( false !== $modified ) {
-				$latest_modified = false === $latest_modified ? $modified : max( $latest_modified, $modified );
+			if ( false === $modified ) {
+				return null;
 			}
+			$latest_modified = false === $latest_modified ? $modified : max( $latest_modified, $modified );
 		}
 
 		return false === $latest_modified ? false : $latest_modified + self::EXPORT_RETENTION_PERIOD;
@@ -434,6 +453,10 @@ class ReportExporter {
 		}
 
 		$expires_at = self::get_export_expiration( $paths );
+		if ( null === $expires_at ) {
+			self::schedule_export_cleanup( $filename, self::EXPORT_CLEANUP_RETRY_PERIOD );
+			return;
+		}
 		if ( false !== $expires_at && time() < $expires_at ) {
 			self::schedule_export_cleanup( $filename, max( 1, $expires_at - time() ) );
 			return;

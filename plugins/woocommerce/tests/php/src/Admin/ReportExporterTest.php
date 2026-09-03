@@ -208,6 +208,37 @@ class ReportExporterTest extends WC_Unit_Test_Case {
 	}
 
 	/**
+	 * @testdox Should retry cleanup when an existing export part cannot be timestamped.
+	 */
+	public function test_cleanup_export_retries_when_expiration_is_unavailable(): void {
+		$paths        = $this->get_export_paths();
+		$filename     = basename( $paths['body'] );
+		$cleanup_hook = ReportExporter::get_action( 'cleanup_export' );
+		$cleanup_args = $this->get_cleanup_action_args( $filename );
+		$this->assertIsString( $cleanup_hook );
+
+		file_put_contents( $paths['body'], 'body' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Creating an export fixture.
+		touch( $paths['body'], time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
+		if ( ! function_exists( 'symlink' ) || ! @symlink( $paths['headers'] . '.missing', $paths['headers'] ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- Symlinks may be unavailable in the test environment.
+			$this->markTestSkipped( 'This test requires symlink support.' );
+		}
+
+		try {
+			ReportExporter::cleanup_export( ...$cleanup_args );
+
+			$this->assertFileExists( $paths['body'], 'Cleanup should retain the export when one part cannot be timestamped.' );
+			$this->assertTrue( is_link( $paths['headers'] ), 'Cleanup should retain the export part whose timestamp is unavailable.' );
+			$cleanup_event = wp_get_scheduled_event( $cleanup_hook, $cleanup_args );
+			$this->assertNotFalse( $cleanup_event, 'Cleanup should retry after a timestamp failure.' );
+			$this->assertGreaterThanOrEqual( time() + DAY_IN_SECONDS - 5, $cleanup_event->timestamp );
+			$this->assertLessThanOrEqual( time() + DAY_IN_SECONDS + 5, $cleanup_event->timestamp );
+		} finally {
+			wp_clear_scheduled_hook( $cleanup_hook, $cleanup_args );
+			as_unschedule_all_actions( $cleanup_hook, $cleanup_args );
+		}
+	}
+
+	/**
 	 * @testdox Should not delete a replacement export until it has been retained for seven days.
 	 */
 	public function test_cleanup_export_defers_recent_replacement(): void {
@@ -282,6 +313,38 @@ class ReportExporterTest extends WC_Unit_Test_Case {
 		} finally {
 			remove_filter( 'woocommerce_analytics_disable_action_scheduling', '__return_true' );
 			wp_clear_scheduled_hook( $cleanup_hook, $cleanup_args );
+		}
+	}
+
+	/**
+	 * @testdox Should remove the status when a completed export cannot be retained.
+	 */
+	public function test_completed_export_without_cleanup_removes_status(): void {
+		$export_id      = str_replace( '-', '', wp_generate_uuid4() );
+		$filename       = 'wc-orders-report-export-' . $export_id . '.csv';
+		$reports_dir    = ReportCSVExporter::get_reports_directory();
+		$this->files[]  = $reports_dir . $filename;
+		$this->files[]  = $reports_dir . $filename . '.headers';
+		$block_schedule = static function () {
+			return false;
+		};
+
+		ReportExporter::update_export_percentage_complete( 'orders', $export_id, 0 );
+		add_filter( 'pre_schedule_event', $block_schedule );
+		add_filter( 'woocommerce_analytics_disable_action_scheduling', '__return_true' );
+
+		try {
+			ReportExporter::export_report( 1, $export_id, 'orders', array() );
+
+			$this->assertFileDoesNotExist( $reports_dir . $filename, 'An untracked completed export should be deleted.' );
+			$this->assertFileDoesNotExist( $reports_dir . $filename . '.headers', 'The completed export headers should be deleted.' );
+			$this->assertFalse( ReportExporter::get_export_percentage_complete( 'orders', $export_id ), 'A deleted export should have a terminal not-found status.' );
+		} finally {
+			remove_filter( 'pre_schedule_event', $block_schedule );
+			remove_filter( 'woocommerce_analytics_disable_action_scheduling', '__return_true' );
+			$statuses = get_option( ReportExporter::EXPORT_STATUS_OPTION, array() );
+			unset( $statuses[ 'orders:' . $export_id ] );
+			update_option( ReportExporter::EXPORT_STATUS_OPTION, $statuses );
 		}
 	}
 
