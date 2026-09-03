@@ -433,8 +433,19 @@ class WC_Product_CSV_Importer_Controller {
 				continue;
 			}
 
-			$state = maybe_unserialize( $token_option['option_value'] );
-			if ( ! is_array( $state ) || ! isset( $state['expires_at'] ) || absint( $state['expires_at'] ) <= time() - self::IMPORT_REQUEST_GRACE_PERIOD ) {
+			$state           = maybe_unserialize( $token_option['option_value'] );
+			$is_import_state =
+				is_array( $state ) &&
+				isset( $state['user_id'], $state['context_hash'], $state['run_id'], $state['phase'], $state['expires_at'] ) &&
+				is_string( $state['context_hash'] ) &&
+				64 === strlen( $state['context_hash'] ) &&
+				ctype_xdigit( $state['context_hash'] ) &&
+				is_string( $state['run_id'] ) &&
+				40 === strlen( $state['run_id'] ) &&
+				ctype_xdigit( $state['run_id'] ) &&
+				in_array( $state['phase'], array( 'import', 'cleanup' ), true );
+
+			if ( $is_import_state && absint( $state['expires_at'] ) <= time() - self::IMPORT_REQUEST_GRACE_PERIOD ) {
 				delete_option( $token_option['option_name'] );
 			}
 		}

@@ -632,6 +632,24 @@ class WC_Product_CSV_Importer_Controller_Test extends WC_Unit_Test_Case {
 	}
 
 	/**
+	 * @testdox Token pruning should preserve unknown option values that share its prefix.
+	 */
+	public function test_import_token_pruning_preserves_unknown_prefixed_options(): void {
+		$option_name = 'wc_product_csv_import_extension_setting';
+		add_option( $option_name, 'preserve', '', false );
+		$class  = new ReflectionClass( WC_Product_CSV_Importer_Controller::class );
+		$method = $class->getMethod( 'delete_expired_import_tokens' );
+		$method->setAccessible( true );
+
+		try {
+			$method->invoke( null );
+			$this->assertSame( 'preserve', get_option( $option_name ) );
+		} finally {
+			delete_option( $option_name );
+		}
+	}
+
+	/**
 	 * @testdox Import requests should match the server-side file position.
 	 */
 	public function test_dispatch_ajax_rejects_mismatched_import_position(): void {
