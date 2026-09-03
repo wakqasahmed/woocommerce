@@ -10,6 +10,7 @@ declare( strict_types = 1 );
 namespace Automattic\WooCommerce\Tests\Admin;
 
 use Automattic\WooCommerce\Admin\ReportCSVExporter;
+use Automattic\WooCommerce\Admin\ReportExporter;
 use WC_Unit_Test_Case;
 
 /**
@@ -69,11 +70,11 @@ class ReportCSVExporterTest extends WC_Unit_Test_Case {
 		$exporter = $this->create_exporter();
 
 		ob_start();
-		$first_result = $exporter->send_file();
+		$first_result = $this->send_file( $exporter );
 		$first_output = ob_get_clean();
 
 		ob_start();
-		$second_result = $exporter->send_file();
+		$second_result = $this->send_file( $exporter );
 		$second_output = ob_get_clean();
 
 		$this->assertTrue( $first_result, 'The first download should succeed.' );
@@ -99,7 +100,7 @@ class ReportCSVExporterTest extends WC_Unit_Test_Case {
 		$exporter = $this->create_exporter();
 
 		ob_start();
-		$result = $exporter->send_file();
+		$result = $this->send_file( $exporter );
 		$output = ob_get_clean();
 
 		$this->assertFalse( $result, 'An incomplete export should not be sent.' );
@@ -116,11 +117,9 @@ class ReportCSVExporterTest extends WC_Unit_Test_Case {
 		file_put_contents( $this->headers_path, 'headers' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Creating an export fixture.
 		file_put_contents( $this->file_path, 'body' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Creating an export fixture.
 		file_put_contents( $unrelated_path, 'unrelated' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Creating an unrelated cleanup fixture.
-		$exporter = $this->create_exporter();
-
 		try {
-			$this->assertTrue( $exporter->delete_file(), 'The complete export should be deleted.' );
-			$this->assertTrue( $exporter->delete_file(), 'Deleting an already missing export should succeed.' );
+			$this->assertTrue( $this->delete_file(), 'The complete export should be deleted.' );
+			$this->assertTrue( $this->delete_file(), 'Deleting an already missing export should succeed.' );
 			$this->assertFileDoesNotExist( $this->file_path, 'The export body should be removed.' );
 			$this->assertFileDoesNotExist( $this->headers_path, 'The export headers should be removed.' );
 			$this->assertFileExists( $unrelated_path, 'Cleanup should not remove unrelated files.' );
@@ -145,5 +144,30 @@ class ReportCSVExporterTest extends WC_Unit_Test_Case {
 		$exporter->set_filename( $this->filename );
 
 		return $exporter;
+	}
+
+	/**
+	 * Invoke the report handler's private streaming helper.
+	 *
+	 * @param ReportCSVExporter $exporter Exporter used to send download headers.
+	 * @return bool Whether the response started.
+	 */
+	private function send_file( ReportCSVExporter $exporter ): bool {
+		$method = new \ReflectionMethod( ReportExporter::class, 'send_export_file' );
+		$method->setAccessible( true );
+
+		return (bool) $method->invoke( null, $exporter, basename( $this->file_path ) );
+	}
+
+	/**
+	 * Invoke the report handler's private deletion helper.
+	 *
+	 * @return bool Whether both export files are absent.
+	 */
+	private function delete_file(): bool {
+		$method = new \ReflectionMethod( ReportExporter::class, 'delete_export_file' );
+		$method->setAccessible( true );
+
+		return (bool) $method->invoke( null, basename( $this->file_path ) );
 	}
 }

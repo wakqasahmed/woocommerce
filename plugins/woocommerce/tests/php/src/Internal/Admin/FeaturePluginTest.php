@@ -149,15 +149,30 @@ class FeaturePluginTest extends WC_Unit_Test_Case {
 	 * @preserveGlobalState disabled
 	 */
 	public function test_report_export_cleanup_is_initialized_when_analytics_is_disabled(): void {
-		$hook     = ReportExporter::get_action( 'cleanup_export' );
-		$callback = array( ReportExporter::class, 'do_action_or_reschedule' );
-		$this->assertIsString( $hook, 'The cleanup hook should be defined.' );
-		remove_action( $hook, $callback, 10 );
+		$cleanup_hook      = ReportExporter::get_action( 'cleanup_export' );
+		$export_hook       = ReportExporter::get_action( 'export_report' );
+		$email_hook        = ReportExporter::get_action( 'email_report_download_link' );
+		$scheduler_hook    = ReportExporter::get_action( 'schedule_action' );
+		$callback          = array( ReportExporter::class, 'do_action_or_reschedule' );
+		$download_callback = array( ReportExporter::class, 'download_export_file' );
+		$this->assertIsString( $cleanup_hook, 'The cleanup hook should be defined.' );
+		$this->assertIsString( $export_hook, 'The export hook should be defined.' );
+		$this->assertIsString( $email_hook, 'The email hook should be defined.' );
+		$this->assertIsString( $scheduler_hook, 'The scheduler hook should be defined.' );
+		remove_action( $cleanup_hook, $callback, 10 );
+		remove_action( $export_hook, $callback, 10 );
+		remove_action( $email_hook, $callback, 10 );
+		remove_action( $scheduler_hook, $callback, 10 );
+		remove_action( 'admin_init', $download_callback, 10 );
 		update_option( Analytics::TOGGLE_OPTION_NAME, 'no' );
 
 		FeaturePlugin::instance()->includes();
 
-		$this->assertSame( 10, has_action( $hook, $callback ), 'Disabling Analytics should not disable cleanup for retained exports.' );
+		$this->assertSame( 10, has_action( $cleanup_hook, $callback ), 'Disabling Analytics should not disable cleanup for retained exports.' );
+		$this->assertSame( 10, has_action( 'admin_init', $download_callback ), 'Disabling Analytics should not disable retained export downloads.' );
+		$this->assertFalse( has_action( $export_hook, $callback ), 'Disabling Analytics should keep export generation disabled.' );
+		$this->assertFalse( has_action( $email_hook, $callback ), 'Disabling Analytics should keep export emails disabled.' );
+		$this->assertFalse( has_action( $scheduler_hook, $callback ), 'Disabling Analytics should keep export scheduling disabled.' );
 	}
 
 	/**

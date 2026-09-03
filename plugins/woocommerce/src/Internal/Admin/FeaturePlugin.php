@@ -172,12 +172,15 @@ class FeaturePlugin {
 		API\Init::instance();
 
 		Onboarding::init();
-		ReportExporter::init();
 
 		if ( $this->is_analytics_enabled_during_bootstrap() ) {
 			// Initialize Reports syncing.
 			ReportsSync::init();
 			CategoryLookup::instance()->init();
+			// Initialize Reports exporter.
+			ReportExporter::init();
+		} else {
+			ReportExporter::init_retained_exports();
 		}
 
 		// Admin note providers.

@@ -48438,13 +48438,13 @@ parameters:
 		-
 			message: '#^Call to method schedule_single\(\) on an unknown class Automattic\\WooCommerce\\Admin\\Schedulers\\WC_Queue_Interface\.$#'
 			identifier: class.notFound
-			count: 2
+			count: 1
 			path: src/Admin/ReportExporter.php
 
 		-
 			message: '#^Call to method search\(\) on an unknown class Automattic\\WooCommerce\\Admin\\Schedulers\\WC_Queue_Interface\.$#'
 			identifier: class.notFound
-			count: 2
+			count: 1
 			path: src/Admin/ReportExporter.php
 
 		-

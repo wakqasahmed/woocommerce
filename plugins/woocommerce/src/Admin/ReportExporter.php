@@ -50,6 +50,11 @@ class ReportExporter {
 	private const EXPORT_CLEANUP_RETRY_PERIOD = DAY_IN_SECONDS;
 
 	/**
+	 * Action Scheduler group for export cleanup jobs.
+	 */
+	private const EXPORT_CLEANUP_GROUP = 'wc-admin-report-cleanup';
+
+	/**
 	 * Get all available scheduling actions.
 	 * Used to determine action hook names and clear events.
 	 *
@@ -80,6 +85,22 @@ class ReportExporter {
 	public static function init() {
 		// Initialize scheduled action handlers.
 		self::scheduler_init();
+
+		self::init_retained_exports();
+	}
+
+	/**
+	 * Hook in handlers needed for retained exports when Analytics is disabled.
+	 *
+	 * @internal
+	 * @since 11.2.0
+	 * @return void
+	 */
+	public static function init_retained_exports() {
+		$cleanup_hook = self::get_action( 'cleanup_export' );
+		if ( is_string( $cleanup_hook ) ) {
+			add_action( $cleanup_hook, array( __CLASS__, 'do_action_or_reschedule' ), 10, 3 );
+		}
 
 		// Report download handler.
 		add_action( 'admin_init', array( __CLASS__, 'download_export_file' ) );
@@ -125,6 +146,7 @@ class ReportExporter {
 	 * @param string $report_type Report type. E.g. 'customers'.
 	 * @param array  $report_args Report parameters, passed to data query.
 	 * @return void
+	 * @throws \RuntimeException When a completed export can neither be retained safely nor deleted.
 	 */
 	public static function export_report( $page_number, $export_id, $report_type, $report_args ) {
 		$report_args['page'] = $page_number;
@@ -132,13 +154,30 @@ class ReportExporter {
 		$filename = "wc-{$report_type}-report-export-{$export_id}";
 		$exporter = new ReportCSVExporter( $report_type, $report_args );
 		$exporter->set_filename( $filename );
+		$filename         = $exporter->get_filename();
+		$is_initial_batch = 1 === (int) $page_number;
+		if ( $is_initial_batch ) {
+			self::cancel_export_cleanup( $filename );
+		}
 		$exporter->generate_file();
 
-		$percent_complete = $exporter->get_percent_complete();
-		self::update_export_percentage_complete( $report_type, $export_id, $percent_complete );
-		if ( 100 === $percent_complete ) {
-			self::schedule_export_cleanup( $exporter->get_filename() );
+		$percent_complete  = $exporter->get_percent_complete();
+		$cleanup_scheduled = true;
+		if ( $is_initial_batch || 100 === $percent_complete ) {
+			$cleanup_scheduled = self::schedule_export_cleanup( $filename );
 		}
+		if ( 100 === $percent_complete && ! $cleanup_scheduled ) {
+			if ( ! self::delete_export_file( $filename ) ) {
+				wc_get_logger()->error(
+					sprintf( 'Unable to retain or delete report export %s.', $filename ),
+					array( 'source' => 'report-exporter' )
+				);
+				throw new \RuntimeException( 'A completed report export could not be scheduled for cleanup or removed.' );
+			}
+			return;
+		}
+
+		self::update_export_percentage_complete( $report_type, $export_id, $percent_complete );
 	}
 
 	/**
@@ -190,34 +229,226 @@ class ReportExporter {
 	/**
 	 * Schedule cleanup for a completed report export.
 	 *
-	 * @param string $filename Export filename after filters have been applied.
-	 * @param int    $delay    Delay before the first cleanup attempt.
-	 * @return void
+	 * @param string      $filename  Export filename after filters have been applied.
+	 * @param int         $delay     Delay before the first cleanup attempt.
+	 * @param string|null $directory Reports directory used when the cleanup is scheduled.
+	 * @return bool True when at least one cleanup job exists.
 	 */
-	private static function schedule_export_cleanup( $filename, $delay = self::EXPORT_RETENTION_PERIOD ) {
+	private static function schedule_export_cleanup( $filename, $delay = self::EXPORT_RETENTION_PERIOD, $directory = null ) {
 		$action_hook = self::get_action( 'cleanup_export' );
-		if ( ! is_string( $action_hook ) ) {
-			return;
-		}
-
-		$action_args = array( $filename );
-		if ( wp_next_scheduled( $action_hook, $action_args ) ) {
-			return;
+		$action_args = self::get_export_cleanup_args( $filename, $directory );
+		if ( ! is_string( $action_hook ) || false === $action_args ) {
+			return false;
 		}
 
 		$timestamp = time() + $delay;
-		$scheduled = wp_schedule_event( $timestamp, 'daily', $action_hook, $action_args, true );
-		if ( true === $scheduled ) {
-			return;
+
+		$cron_scheduled = (bool) wp_next_scheduled( $action_hook, $action_args );
+		if ( ! $cron_scheduled ) {
+			$cron_scheduled = true === wp_schedule_event( $timestamp, 'daily', $action_hook, $action_args, true );
 		}
 
-		$action_id = WC()->queue()->schedule_single( $timestamp, $action_hook, $action_args, (string) self::$group );
-		if ( ! $action_id ) {
+		$queue_scheduled = false;
+		/**
+		 * Whether to disable Action Scheduler for Analytics jobs.
+		 *
+		 * @since 4.0.0
+		 *
+		 * @param bool $disable_action_scheduling Whether scheduling is disabled.
+		 */
+		$action_scheduling_disabled = apply_filters( 'woocommerce_analytics_disable_action_scheduling', false );
+		if ( get_option( 'schema-ActionScheduler_StoreSchema' ) && ! $action_scheduling_disabled ) {
+			$queue_scheduled = (bool) self::queue()->search(
+				array(
+					'hook'     => $action_hook,
+					'args'     => $action_args,
+					'group'    => self::EXPORT_CLEANUP_GROUP,
+					'status'   => 'pending',
+					'per_page' => 1,
+				),
+				'ids'
+			);
+			if ( ! $queue_scheduled ) {
+				$queue_scheduled = (bool) self::queue()->schedule_single( $timestamp, $action_hook, $action_args, self::EXPORT_CLEANUP_GROUP );
+			}
+		}
+
+		if ( ! $cron_scheduled && ! $queue_scheduled ) {
 			wc_get_logger()->error(
 				sprintf( 'Unable to schedule cleanup for report export %s.', $filename ),
 				array( 'source' => 'report-exporter' )
 			);
 		}
+
+		return $cron_scheduled || $queue_scheduled;
+	}
+
+	/**
+	 * Cancel cleanup jobs for one resolved export filename.
+	 *
+	 * @param string      $filename  Export filename after filters have been applied.
+	 * @param string|null $directory Reports directory used when the cleanup was scheduled.
+	 * @return void
+	 */
+	private static function cancel_export_cleanup( $filename, $directory = null ) {
+		$action_hook = self::get_action( 'cleanup_export' );
+		$action_args = self::get_export_cleanup_args( $filename, $directory );
+		if ( ! is_string( $action_hook ) || false === $action_args ) {
+			return;
+		}
+
+		wp_clear_scheduled_hook( $action_hook, $action_args );
+		if ( get_option( 'schema-ActionScheduler_StoreSchema' ) ) {
+			self::queue()->cancel_all( $action_hook, $action_args, self::EXPORT_CLEANUP_GROUP );
+		}
+	}
+
+	/**
+	 * Build arguments that bind a cleanup job to its original reports directory.
+	 *
+	 * @param mixed $filename  Export filename after filters have been applied.
+	 * @param mixed $directory Reports directory used when the cleanup was scheduled.
+	 * @return array{string, string, string}|false Cleanup arguments, or false when invalid.
+	 */
+	private static function get_export_cleanup_args( $filename, $directory = null ) {
+		$directory = null === $directory ? ReportCSVExporter::get_reports_directory() : $directory;
+		$paths     = self::get_export_file_paths( $filename, $directory );
+		if ( false === $paths ) {
+			return false;
+		}
+
+		$directory = trailingslashit( wp_normalize_path( $directory ) );
+		$checksum  = hash( 'sha256', $filename . "\n" . $directory );
+
+		return array( $filename, $directory, $checksum );
+	}
+
+	/**
+	 * Get the exact paths for a resolved export filename.
+	 *
+	 * @param mixed $filename  Export filename after filters have been applied.
+	 * @param mixed $directory Reports directory containing the export.
+	 * @return array{body: string, headers: string}|false Export paths, or false for an invalid filename.
+	 */
+	private static function get_export_file_paths( $filename, $directory = null ) {
+		if (
+			! is_string( $filename )
+			|| '' === $filename
+			|| '.' === $filename
+			|| '..' === $filename
+			|| false !== strpos( $filename, '/' )
+			|| false !== strpos( $filename, '\\' )
+			|| false !== strpos( $filename, "\0" )
+		) {
+			return false;
+		}
+
+		$directory = null === $directory ? ReportCSVExporter::get_reports_directory() : $directory;
+		if ( ! is_string( $directory ) || '' === $directory || false !== strpos( $directory, "\0" ) ) {
+			return false;
+		}
+
+		$directory = trailingslashit( wp_normalize_path( $directory ) );
+		$suffix    = 'woocommerce_uploads/reports/';
+		if ( substr( $directory, -strlen( $suffix ) ) !== $suffix ) {
+			return false;
+		}
+
+		$body = $directory . $filename;
+		return array(
+			'body'    => $body,
+			'headers' => $body . '.headers',
+		);
+	}
+
+	/**
+	 * Get the time after which both parts of an export may be removed.
+	 *
+	 * @param array{body: string, headers: string} $paths Export paths.
+	 * @return int|false Expiration timestamp, or false when both files are absent.
+	 */
+	private static function get_export_expiration( $paths ) {
+		$latest_modified = false;
+		foreach ( $paths as $path ) {
+			clearstatcache( true, $path );
+			if ( ! file_exists( $path ) && ! is_link( $path ) ) {
+				continue;
+			}
+
+			$modified = @filemtime( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged -- A file can be deleted between the existence and timestamp checks.
+			if ( false !== $modified ) {
+				$latest_modified = false === $latest_modified ? $modified : max( $latest_modified, $modified );
+			}
+		}
+
+		return false === $latest_modified ? false : $latest_modified + self::EXPORT_RETENTION_PERIOD;
+	}
+
+	/**
+	 * Stream a complete export without deleting it.
+	 *
+	 * @param ReportCSVExporter $exporter Exporter used to send download headers.
+	 * @param string            $filename Resolved export filename.
+	 * @return bool True when the response started, false when either export part is unavailable.
+	 */
+	private static function send_export_file( $exporter, $filename ) {
+		$paths = self::get_export_file_paths( $filename );
+		if ( false === $paths ) {
+			return false;
+		}
+
+		$headers_handle = @fopen( $paths['headers'], 'rb' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- The export can expire or be deleted between validation and opening it.
+		if ( false === $headers_handle ) {
+			return false;
+		}
+
+		$file_handle = @fopen( $paths['body'], 'rb' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen, WordPress.PHP.NoSilencedErrors.Discouraged -- The export can expire or be deleted between validation and opening it.
+		if ( false === $file_handle ) {
+			fclose( $headers_handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+			return false;
+		}
+
+		$exporter->send_headers();
+
+		try {
+			$headers_sent = false !== fpassthru( $headers_handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fpassthru, WordPress.Security.EscapeOutput.OutputNotEscaped -- Streaming a generated CSV download.
+			$file_sent    = false !== fpassthru( $file_handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fpassthru, WordPress.Security.EscapeOutput.OutputNotEscaped -- Streaming a generated CSV download.
+		} finally {
+			fclose( $headers_handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+			fclose( $file_handle ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fclose
+		}
+
+		if ( ! $headers_sent || ! $file_sent ) {
+			wc_get_logger()->error(
+				'Unable to finish streaming a report export.',
+				array( 'source' => 'report-exporter' )
+			);
+		}
+
+		// Headers and possibly part of the body have already been sent, so the request must terminate.
+		return true;
+	}
+
+	/**
+	 * Delete both parts of one resolved export.
+	 *
+	 * @param string      $filename  Export filename after filters have been applied.
+	 * @param string|null $directory Reports directory containing the export.
+	 * @return bool True when both files are absent after cleanup.
+	 */
+	private static function delete_export_file( $filename, $directory = null ) {
+		$paths = self::get_export_file_paths( $filename, $directory );
+		if ( false === $paths ) {
+			return false;
+		}
+
+		foreach ( $paths as $path ) {
+			if ( file_exists( $path ) || is_link( $path ) ) {
+				wp_delete_file( $path );
+			}
+		}
+
+		return ! file_exists( $paths['body'] ) && ! is_link( $paths['body'] ) && ! file_exists( $paths['headers'] ) && ! is_link( $paths['headers'] );
 	}
 
 	/**
@@ -227,28 +458,34 @@ class ReportExporter {
 	 *
 	 * @since 11.2.0
 	 *
-	 * @param string $filename Export filename after filters have been applied.
+	 * @param mixed $filename  Export filename after filters have been applied.
+	 * @param mixed $directory Reports directory used when cleanup was scheduled.
+	 * @param mixed $checksum  Checksum binding the filename to the directory.
 	 * @return void
 	 */
-	public static function cleanup_export( $filename ) {
-		if ( ! is_string( $filename ) ) {
+	public static function cleanup_export( $filename, $directory, $checksum ) {
+		$action_args = self::get_export_cleanup_args( $filename, $directory );
+		if ( false === $action_args || ! is_string( $checksum ) || ! hash_equals( $action_args[2], $checksum ) ) {
 			return;
 		}
 
-		$exporter = new ReportCSVExporter();
-		if ( ! $exporter->delete_file( $filename ) ) {
+		$paths      = self::get_export_file_paths( $filename, $directory );
+		$expires_at = false === $paths ? false : self::get_export_expiration( $paths );
+		if ( false !== $expires_at && time() < $expires_at ) {
+			self::schedule_export_cleanup( $filename, max( 1, $expires_at - time() ), $directory );
+			return;
+		}
+
+		if ( ! self::delete_export_file( $filename, $directory ) ) {
 			wc_get_logger()->warning(
 				sprintf( 'Unable to delete expired report export %s.', $filename ),
 				array( 'source' => 'report-exporter' )
 			);
-			self::schedule_export_cleanup( $filename, self::EXPORT_CLEANUP_RETRY_PERIOD );
+			self::schedule_export_cleanup( $filename, self::EXPORT_CLEANUP_RETRY_PERIOD, $directory );
 			return;
 		}
 
-		$action_hook = self::get_action( 'cleanup_export' );
-		if ( is_string( $action_hook ) ) {
-			wp_clear_scheduled_hook( $action_hook, array( $filename ) );
-		}
+		self::cancel_export_cleanup( $filename, $directory );
 	}
 
 	/**
@@ -275,9 +512,17 @@ class ReportExporter {
 
 		$exporter = new ReportCSVExporter();
 		$exporter->set_filename( wp_unslash( $_GET['filename'] ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- set_filename() sanitizes the filename and keeps it inside the reports directory.
-		if ( ! $exporter->send_file() ) {
+		$filename = $exporter->get_filename();
+		if ( ! self::send_export_file( $exporter, $filename ) ) {
 			status_header( 404 );
 			return;
+		}
+
+		if ( ! self::schedule_export_cleanup( $filename ) && ! self::delete_export_file( $filename ) ) {
+			wc_get_logger()->error(
+				sprintf( 'Unable to retain or delete report export %s after download.', $filename ),
+				array( 'source' => 'report-exporter' )
+			);
 		}
 
 		exit;

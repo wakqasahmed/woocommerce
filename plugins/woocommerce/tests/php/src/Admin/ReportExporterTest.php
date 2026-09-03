@@ -148,8 +148,10 @@ class ReportExporterTest extends WC_Unit_Test_Case {
 		try {
 			file_put_contents( $body, 'body' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Creating an export fixture.
 			file_put_contents( $headers, 'headers' ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- Creating an export fixture.
+			touch( $body, time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
+			touch( $headers, time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
 
-			ReportExporter::cleanup_export( $filename );
+			ReportExporter::cleanup_export( ...$this->get_cleanup_action_args( $filename ) );
 
 			$this->assertFalse( $filter_called, 'Cleanup should not resolve the filename through live filters.' );
 			$this->assertFileDoesNotExist( $body, 'Cleanup should remove the resolved export body.' );
@@ -166,25 +168,137 @@ class ReportExporterTest extends WC_Unit_Test_Case {
 		$paths           = $this->create_export_files();
 		$filename        = basename( $paths['body'] );
 		$cleanup_hook    = ReportExporter::get_action( 'cleanup_export' );
-		$cleanup_args    = array( $filename );
+		$cleanup_args    = $this->get_cleanup_action_args( $filename );
 		$redirect_delete = static function ( $path ) {
 			return $path . '.blocked';
 		};
 		$this->assertIsString( $cleanup_hook );
+		touch( $paths['body'], time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
+		touch( $paths['headers'], time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
 		add_filter( 'wp_delete_file', $redirect_delete );
 
 		try {
-			ReportExporter::cleanup_export( $filename );
+			ReportExporter::cleanup_export( ...$cleanup_args );
 
 			$this->assertFileExists( $paths['body'], 'A failed cleanup should retain the export body.' );
 			$this->assertFileExists( $paths['headers'], 'A failed cleanup should retain the export headers.' );
 			$cleanup_event = wp_get_scheduled_event( $cleanup_hook, $cleanup_args );
 			$this->assertNotFalse( $cleanup_event, 'A failed cleanup should schedule another attempt.' );
 			$this->assertSame( 'daily', $cleanup_event->schedule, 'Cleanup should keep retrying until deletion succeeds.' );
-			$this->assertGreaterThanOrEqual( time() + DAY_IN_SECONDS - 1, $cleanup_event->timestamp );
-			$this->assertLessThanOrEqual( time() + DAY_IN_SECONDS + 1, $cleanup_event->timestamp );
+			$this->assertGreaterThanOrEqual( time() + DAY_IN_SECONDS - 5, $cleanup_event->timestamp );
+			$this->assertLessThanOrEqual( time() + DAY_IN_SECONDS + 5, $cleanup_event->timestamp );
+			$cleanup_actions = as_get_scheduled_actions(
+				array(
+					'hook'     => $cleanup_hook,
+					'args'     => $cleanup_args,
+					'status'   => \ActionScheduler_Store::STATUS_PENDING,
+					'per_page' => 1,
+				)
+			);
+			$this->assertCount( 1, $cleanup_actions, 'A failed cleanup should also queue another attempt.' );
+			$cleanup_action = reset( $cleanup_actions );
+			$scheduled_date = $cleanup_action->get_schedule()->get_date();
+			$this->assertNotNull( $scheduled_date );
+			$this->assertGreaterThanOrEqual( time() + DAY_IN_SECONDS - 5, $scheduled_date->getTimestamp() );
+			$this->assertLessThanOrEqual( time() + DAY_IN_SECONDS + 5, $scheduled_date->getTimestamp() );
 		} finally {
 			remove_filter( 'wp_delete_file', $redirect_delete );
+			ReportExporter::cleanup_export( ...$cleanup_args );
+		}
+	}
+
+	/**
+	 * @testdox Should not delete a replacement export until it has been retained for seven days.
+	 */
+	public function test_cleanup_export_defers_recent_replacement(): void {
+		$paths        = $this->create_export_files();
+		$filename     = basename( $paths['body'] );
+		$cleanup_hook = ReportExporter::get_action( 'cleanup_export' );
+		$cleanup_args = $this->get_cleanup_action_args( $filename );
+		$this->assertIsString( $cleanup_hook );
+
+		try {
+			ReportExporter::cleanup_export( ...$cleanup_args );
+
+			$this->assertFileExists( $paths['body'], 'A recent replacement body should be retained.' );
+			$this->assertFileExists( $paths['headers'], 'Recent replacement headers should be retained.' );
+			$cleanup_event = wp_get_scheduled_event( $cleanup_hook, $cleanup_args );
+			$this->assertNotFalse( $cleanup_event, 'Cleanup should remain scheduled for the replacement.' );
+			$this->assertGreaterThanOrEqual( time() + WEEK_IN_SECONDS - 5, $cleanup_event->timestamp );
+			$this->assertLessThanOrEqual( time() + WEEK_IN_SECONDS + 5, $cleanup_event->timestamp );
+		} finally {
+			wp_clear_scheduled_hook( $cleanup_hook, $cleanup_args );
+			as_unschedule_all_actions( $cleanup_hook, $cleanup_args );
+		}
+	}
+
+	/**
+	 * @testdox Should clean up the original directory after the uploads directory changes.
+	 */
+	public function test_cleanup_export_uses_scheduled_directory(): void {
+		$paths         = $this->create_export_files();
+		$filename      = basename( $paths['body'] );
+		$cleanup_args  = $this->get_cleanup_action_args( $filename );
+		$upload_filter = static function ( $uploads ) {
+			$uploads['basedir'] = trailingslashit( $uploads['basedir'] ) . 'moved';
+			return $uploads;
+		};
+		touch( $paths['body'], time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
+		touch( $paths['headers'], time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
+		add_filter( 'upload_dir', $upload_filter );
+
+		try {
+			ReportExporter::cleanup_export( ...$cleanup_args );
+
+			$this->assertFileDoesNotExist( $paths['body'], 'Cleanup should remove the body from its original directory.' );
+			$this->assertFileDoesNotExist( $paths['headers'], 'Cleanup should remove the headers from their original directory.' );
+		} finally {
+			remove_filter( 'upload_dir', $upload_filter );
+		}
+	}
+
+	/**
+	 * @testdox Should reject a cleanup job whose scheduled directory was changed.
+	 */
+	public function test_cleanup_export_rejects_tampered_directory(): void {
+		$paths        = $this->create_export_files();
+		$filename     = basename( $paths['body'] );
+		$cleanup_args = $this->get_cleanup_action_args( $filename );
+		touch( $paths['body'], time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
+		touch( $paths['headers'], time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
+		$cleanup_args[1] .= 'changed/woocommerce_uploads/reports/';
+
+		ReportExporter::cleanup_export( ...$cleanup_args );
+
+		$this->assertFileExists( $paths['body'], 'A cleanup job with a changed directory should not delete the body.' );
+		$this->assertFileExists( $paths['headers'], 'A cleanup job with a changed directory should not delete the headers.' );
+	}
+
+	/**
+	 * @testdox Should use only WP-Cron when Analytics Action Scheduler jobs are disabled.
+	 */
+	public function test_cleanup_schedule_respects_action_scheduler_filter(): void {
+		$paths        = $this->create_export_files();
+		$filename     = basename( $paths['body'] );
+		$cleanup_hook = ReportExporter::get_action( 'cleanup_export' );
+		$cleanup_args = $this->get_cleanup_action_args( $filename );
+		$this->assertIsString( $cleanup_hook );
+		add_filter( 'woocommerce_analytics_disable_action_scheduling', '__return_true' );
+
+		try {
+			$this->assertTrue( $this->schedule_export_cleanup( $filename ), 'WP-Cron should keep cleanup available.' );
+			$this->assertNotFalse( wp_get_scheduled_event( $cleanup_hook, $cleanup_args ), 'A WP-Cron cleanup should be scheduled.' );
+			$cleanup_actions = as_get_scheduled_actions(
+				array(
+					'hook'     => $cleanup_hook,
+					'args'     => $cleanup_args,
+					'status'   => \ActionScheduler_Store::STATUS_PENDING,
+					'per_page' => 1,
+				)
+			);
+			$this->assertCount( 0, $cleanup_actions, 'The filter should prevent the Action Scheduler fallback.' );
+		} finally {
+			remove_filter( 'woocommerce_analytics_disable_action_scheduling', '__return_true' );
 			wp_clear_scheduled_hook( $cleanup_hook, $cleanup_args );
 		}
 	}
@@ -221,6 +335,35 @@ class ReportExporterTest extends WC_Unit_Test_Case {
 			'body'    => $body,
 			'headers' => $headers,
 		);
+	}
+
+	/**
+	 * Build the validated arguments used by an export cleanup job.
+	 *
+	 * @param string $filename Export filename.
+	 * @return array{string, string, string} Cleanup arguments.
+	 */
+	private function get_cleanup_action_args( string $filename ): array {
+		$method = new \ReflectionMethod( ReportExporter::class, 'get_export_cleanup_args' );
+		$method->setAccessible( true );
+		$args = $method->invoke( null, $filename );
+
+		$this->assertIsArray( $args );
+
+		return $args;
+	}
+
+	/**
+	 * Schedule cleanup through the private production helper.
+	 *
+	 * @param string $filename Export filename.
+	 * @return bool Whether a cleanup job exists.
+	 */
+	private function schedule_export_cleanup( string $filename ): bool {
+		$method = new \ReflectionMethod( ReportExporter::class, 'schedule_export_cleanup' );
+		$method->setAccessible( true );
+
+		return (bool) $method->invoke( null, $filename );
 	}
 
 	/**

@@ -149,15 +149,28 @@ class WC_Admin_Tests_API_Reports_Export extends WC_REST_Unit_Test_Case {
 
 		// Run the pending export jobs.
 		WC_Helper_Queue::run_all_pending( 'wc-admin-data' );
-		$cleanup_hook = ReportExporter::get_action( 'cleanup_export' );
-		$cleanup_args = array( 'wc-taxes-report-export-' . $export['export_id'] . '.csv' );
+		$cleanup_hook        = ReportExporter::get_action( 'cleanup_export' );
+		$cleanup_args_method = new ReflectionMethod( ReportExporter::class, 'get_export_cleanup_args' );
+		$cleanup_args_method->setAccessible( true );
+		$cleanup_args = $cleanup_args_method->invoke( null, 'wc-taxes-report-export-' . $export['export_id'] . '.csv' ); // phpcs:ignore Generic.Formatting.MultipleStatementAlignment.NotSameWarning -- Keeping the reflection setup readable.
 		$this->assertIsString( $cleanup_hook );
+		$this->assertIsArray( $cleanup_args );
 		$cleanup_event = wp_get_scheduled_event( $cleanup_hook, $cleanup_args );
 		$this->assertNotFalse( $cleanup_event );
 		$this->assertSame( 'daily', $cleanup_event->schedule );
-		$this->assertGreaterThanOrEqual( time() + WEEK_IN_SECONDS - 1, $cleanup_event->timestamp );
-		$this->assertLessThanOrEqual( time() + WEEK_IN_SECONDS + 1, $cleanup_event->timestamp );
+		$this->assertGreaterThanOrEqual( time() + WEEK_IN_SECONDS - 5, $cleanup_event->timestamp );
+		$this->assertLessThanOrEqual( time() + WEEK_IN_SECONDS + 5, $cleanup_event->timestamp );
+		$cleanup_actions = as_get_scheduled_actions(
+			array(
+				'hook'     => $cleanup_hook,
+				'args'     => $cleanup_args,
+				'status'   => ActionScheduler_Store::STATUS_PENDING,
+				'per_page' => 1,
+			)
+		);
+		$this->assertCount( 1, $cleanup_actions, 'The export should also have a queued cleanup fallback.' );
 		wp_clear_scheduled_hook( $cleanup_hook, $cleanup_args );
+		as_unschedule_all_actions( $cleanup_hook, $cleanup_args );
 
 		// Check that the status shows 100% and includes a download url.
 		$response = $this->server->dispatch( new WP_REST_Request( 'GET', $status_route ) );
