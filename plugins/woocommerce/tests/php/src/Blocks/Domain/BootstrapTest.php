@@ -99,13 +99,11 @@ class BootstrapTest extends WC_Unit_Test_Case {
 
 		foreach ( $callbacks as $callbacks_at_priority ) {
 			foreach ( $callbacks_at_priority as $callback ) {
-				if ( $callback['function'] instanceof \Closure ) {
-					$reflection = new \ReflectionFunction( $callback['function'] );
-				} elseif ( is_array( $callback['function'] ) ) {
-					$reflection = new \ReflectionMethod( $callback['function'][0], $callback['function'][1] );
-				} else {
+				$callback_function = $callback['function'] ?? null;
+				if ( ! is_callable( $callback_function ) ) {
 					continue;
 				}
+				$reflection = new \ReflectionFunction( \Closure::fromCallable( $callback_function ) );
 
 				$this->assertNotSame(
 					$bootstrap_file,

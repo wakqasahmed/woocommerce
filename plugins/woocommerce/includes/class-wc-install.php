@@ -8,6 +8,7 @@
 
 use Automattic\Jetpack\Constants;
 use Automattic\WooCommerce\Admin\API\Reports\Orders\Stats\DataStore;
+use Automattic\WooCommerce\Blocks\InboxNotifications;
 use Automattic\WooCommerce\Enums\ProductType;
 use Automattic\WooCommerce\Internal\Admin\EmailImprovements\EmailImprovements;
 use Automattic\WooCommerce\Internal\Caches\ProductCacheController;
@@ -353,7 +354,7 @@ class WC_Install {
 		'11.2.0'   => array(
 			'wc_update_1120_remove_abandoned_cart_recovery',
 			'wc_update_1120_migrate_stock_notifications_alpha_constant',
-			'wc_update_1120_delete_surface_cart_checkout_note',
+			'WC_Install::delete_surface_cart_checkout_note',
 		),
 	);
 
@@ -981,6 +982,19 @@ class WC_Install {
 	 */
 	public static function get_db_update_callbacks() {
 		return self::$db_updates;
+	}
+
+	/**
+	 * Delete the retired Surface Cart and Checkout inbox note.
+	 *
+	 * @internal
+	 *
+	 * @since 11.2.0
+	 *
+	 * @return void
+	 */
+	public static function delete_surface_cart_checkout_note(): void {
+		InboxNotifications::delete_surface_cart_checkout_blocks_notification();
 	}
 
 	/**
