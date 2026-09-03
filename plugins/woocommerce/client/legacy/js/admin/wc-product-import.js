@@ -13,7 +13,9 @@
 		this.update_existing    = wc_product_import_params.update_existing;
 		this.delimiter          = wc_product_import_params.delimiter;
 		this.security           = wc_product_import_params.import_nonce;
+		this.import_token       = wc_product_import_params.import_token;
 		this.character_encoding = wc_product_import_params.character_encoding;
+		this.cleanup_error_retries = 0;
 
 		// Number of import successes/failures.
 		this.imported = 0;
@@ -41,6 +43,26 @@
 	};
 
 	/**
+	 * Continue server-directed cleanup after an import or cleanup error.
+	 */
+	productImportForm.prototype.retry_cleanup = function( response_data ) {
+		if (
+			response_data &&
+			'string' === typeof response_data.position &&
+			'string' === typeof response_data.import_token &&
+			response_data.position === 'cleanup:' + response_data.import_token &&
+			this.cleanup_error_retries < 3
+		) {
+			this.cleanup_error_retries++;
+			this.run_import();
+
+			return true;
+		}
+
+		return false;
+	};
+
+	/**
 	 * Run the import in batches until finished.
 	 */
 	productImportForm.prototype.run_import = function() {
@@ -57,12 +79,15 @@
 				update_existing   : $this.update_existing,
 				delimiter         : $this.delimiter,
 				security          : $this.security,
+				import_token      : $this.import_token,
 				character_encoding: $this.character_encoding
 			},
 			dataType: 'json',
 			success: function( response ) {
+				$this.import_token = response.data && response.data.import_token || $this.import_token;
 				if ( response.success ) {
 					$this.position  = response.data.position;
+					$this.cleanup_error_retries = 0;
 					$this.imported += response.data.imported;
 					$this.imported_variations += response.data.imported_variations;
 					$this.failed   += response.data.failed;
@@ -89,6 +114,10 @@
 						$this.run_import();
 					}
 				} else {
+					$this.position = response.data && response.data.position || $this.position;
+					if ( $this.retry_cleanup( response.data ) ) {
+						return;
+					}
 					$this.show_error(
 						response.data && response.data.message ?
 							response.data.message :
@@ -97,9 +126,15 @@
 				}
 			}
 		} ).fail( function( response ) {
+			var response_data = response.responseJSON && response.responseJSON.data;
+			$this.import_token = response_data && response_data.import_token || $this.import_token;
+			$this.position = response_data && response_data.position || $this.position;
+			if ( $this.retry_cleanup( response_data ) ) {
+				return;
+			}
 			$this.show_error(
-				response.responseJSON && response.responseJSON.data && response.responseJSON.data.message ?
-					response.responseJSON.data.message :
+				response_data && response_data.message ?
+					response_data.message :
 					wc_product_import_params.import_error
 			);
 		} );

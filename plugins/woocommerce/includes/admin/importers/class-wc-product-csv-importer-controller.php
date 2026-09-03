@@ -37,6 +37,31 @@ class WC_Product_CSV_Importer_Controller {
 	private const IMPORT_CLEANUP_POSITION_PREFIX = 'cleanup:';
 
 	/**
+	 * Meta key used to associate temporary products with an import run.
+	 */
+	private const IMPORT_RUN_META_KEY = '_wc_product_csv_import_run_id';
+
+	/**
+	 * Meta key that records when temporary import ownership expires.
+	 */
+	private const IMPORT_RUN_EXPIRATION_META_KEY = '_wc_product_csv_import_run_expires_at';
+
+	/**
+	 * Prefix for server-side import token state.
+	 */
+	private const IMPORT_TOKEN_OPTION_PREFIX = 'wc_product_csv_import_';
+
+	/**
+	 * Lifetime of an import token and its temporary product ownership.
+	 */
+	private const IMPORT_TOKEN_EXPIRATION = DAY_IN_SECONDS;
+
+	/**
+	 * Keep expired state reserved long enough for an admitted request to finish.
+	 */
+	private const IMPORT_REQUEST_GRACE_PERIOD = HOUR_IN_SECONDS;
+
+	/**
 	 * The path to the current file.
 	 *
 	 * @var string
@@ -100,8 +125,19 @@ class WC_Product_CSV_Importer_Controller {
 	 * @return WC_Product_CSV_Importer
 	 */
 	public static function get_importer( $file, $args = array() ) {
+		$reserved_args  = array_intersect_key( $args, array_flip( array( 'import_run_id', 'import_run_expires_at' ) ) );
 		$importer_class = apply_filters( 'woocommerce_product_csv_importer_class', 'WC_Product_CSV_Importer' );
-		$args           = apply_filters( 'woocommerce_product_csv_importer_args', $args, $importer_class );
+
+		/**
+		 * Filters the arguments used by the product CSV importer.
+		 *
+		 * @since 3.1.0
+		 *
+		 * @param array  $args Importer arguments.
+		 * @param string $importer_class Importer class name.
+		 */
+		$filtered_args = apply_filters( 'woocommerce_product_csv_importer_args', $args, $importer_class );
+		$args          = is_array( $filtered_args ) ? array_merge( $filtered_args, $reserved_args ) : $args;
 		return new $importer_class( $file, $args );
 	}
 
@@ -327,42 +363,305 @@ class WC_Product_CSV_Importer_Controller {
 	}
 
 	/**
+	 * Hash the immutable request values that identify an import.
+	 *
+	 * @param string $file Import file path.
+	 * @param array  $mapping Column mapping.
+	 * @param string $delimiter Field delimiter.
+	 * @param bool   $update_existing Whether existing products may be updated.
+	 * @param string $character_encoding Source character encoding.
+	 * @return string Import context hash.
+	 */
+	private static function get_import_context_hash( string $file, array $mapping, string $delimiter, bool $update_existing, string $character_encoding ): string {
+		return hash(
+			'sha256',
+			(string) wp_json_encode(
+				array(
+					'file'               => wp_normalize_path( $file ),
+					'mapping'            => $mapping,
+					'delimiter'          => $delimiter,
+					'update_existing'    => $update_existing,
+					'character_encoding' => $character_encoding,
+				)
+			)
+		);
+	}
+
+	/**
+	 * Persist import state under a new random token.
+	 *
+	 * @param array  $state Import state.
+	 * @param string $preserve_token Token being atomically replaced, if any.
+	 * @throws RuntimeException When state cannot be persisted.
+	 * @return string Import token.
+	 */
+	private static function create_import_token( array $state, string $preserve_token = '' ): string {
+		self::delete_expired_import_tokens( $preserve_token );
+
+		for ( $attempt = 0; $attempt < 3; ++$attempt ) {
+			$token = wc_rand_hash();
+			if ( add_option( self::get_import_token_option_name( $token ), $state, '', false ) ) {
+				return $token;
+			}
+		}
+
+		throw new RuntimeException( esc_html__( 'Import could not be completed. Please start again.', 'woocommerce' ) );
+	}
+
+	/**
+	 * Delete a bounded set of abandoned, expired token records.
+	 *
+	 * @param string $preserve_token Token that is currently being replaced.
+	 * @return void
+	 */
+	private static function delete_expired_import_tokens( string $preserve_token = '' ): void {
+		global $wpdb;
+		$preserved_option_name = $preserve_token ? self::get_import_token_option_name( $preserve_token ) : '';
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Import tokens are private non-autoloaded options and are pruned in a bounded batch.
+		$token_options = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s ORDER BY option_id ASC LIMIT %d",
+				$wpdb->esc_like( self::IMPORT_TOKEN_OPTION_PREFIX ) . '%',
+				self::IMPORT_CLEANUP_BATCH_SIZE
+			),
+			ARRAY_A
+		);
+
+		foreach ( $token_options as $token_option ) {
+			if ( $preserved_option_name === $token_option['option_name'] ) {
+				continue;
+			}
+
+			$state = maybe_unserialize( $token_option['option_value'] );
+			if ( ! is_array( $state ) || ! isset( $state['expires_at'] ) || absint( $state['expires_at'] ) <= time() - self::IMPORT_REQUEST_GRACE_PERIOD ) {
+				delete_option( $token_option['option_name'] );
+			}
+		}
+	}
+
+	/**
+	 * Read and validate server-side import state.
+	 *
+	 * @param string $token Import token.
+	 * @param string $context_hash Import context hash.
+	 * @param string $phase Expected import phase.
+	 * @throws RuntimeException When the token is invalid, expired, or mismatched.
+	 * @return array Import state.
+	 */
+	private static function get_import_state( string $token, string $context_hash, string $phase ): array {
+		if ( 40 !== strlen( $token ) || ! ctype_xdigit( $token ) ) {
+			throw new RuntimeException( esc_html__( 'Import could not be completed. Please start again.', 'woocommerce' ) );
+		}
+
+		$option_name = self::get_import_token_option_name( $token );
+		$state       = get_option( $option_name );
+		if (
+			! is_array( $state ) ||
+			! isset( $state['user_id'], $state['context_hash'], $state['run_id'], $state['phase'], $state['expires_at'] ) ||
+			get_current_user_id() !== absint( $state['user_id'] ) ||
+			! is_string( $state['context_hash'] ) ||
+			! hash_equals( $state['context_hash'], $context_hash ) ||
+			! is_string( $state['run_id'] ) ||
+			40 !== strlen( $state['run_id'] ) ||
+			! ctype_xdigit( $state['run_id'] ) ||
+			$phase !== $state['phase'] ||
+			absint( $state['expires_at'] ) <= time()
+		) {
+			throw new RuntimeException( esc_html__( 'Import could not be completed. Please start again.', 'woocommerce' ) );
+		}
+
+		return $state;
+	}
+
+	/**
+	 * Atomically consume an import token.
+	 *
+	 * @param string $token Import token.
+	 * @param array  $state State returned by get_import_state().
+	 * @throws RuntimeException When the token was already consumed.
+	 * @return void
+	 */
+	private static function consume_import_token( string $token, array $state ): void {
+		global $wpdb;
+
+		$option_name = self::get_import_token_option_name( $token );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Exact compare-and-delete makes the token single-use across concurrent requests.
+		$deleted = $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", $option_name, maybe_serialize( $state ) ) );
+		wp_cache_delete( $option_name, 'options' );
+
+		if ( 1 !== $deleted ) {
+			throw new RuntimeException( esc_html__( 'Import could not be completed. Please start again.', 'woocommerce' ) );
+		}
+	}
+
+	/**
+	 * Atomically replace the state stored under an unexposed recovery token.
+	 *
+	 * @param string $token Import token.
+	 * @param array  $expected_state Current token state.
+	 * @param array  $next_state Replacement token state.
+	 * @throws RuntimeException When token state cannot be advanced.
+	 * @return void
+	 */
+	private static function replace_import_token_state( string $token, array $expected_state, array $next_state ): void {
+		global $wpdb;
+
+		$option_name = self::get_import_token_option_name( $token );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Exact compare-and-swap advances only the unexposed recovery token created for this request.
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+				maybe_serialize( $next_state ),
+				$option_name,
+				maybe_serialize( $expected_state )
+			)
+		);
+		wp_cache_delete( $option_name, 'options' );
+
+		if ( 1 !== $updated ) {
+			throw new RuntimeException( esc_html__( 'Import could not be completed. Please start again.', 'woocommerce' ) );
+		}
+	}
+
+	/**
+	 * Get the option name for an opaque import token.
+	 *
+	 * @param string $token Import token.
+	 * @return string Option name.
+	 */
+	private static function get_import_token_option_name( string $token ): string {
+		return self::IMPORT_TOKEN_OPTION_PREFIX . hash( 'sha256', $token );
+	}
+
+	/**
 	 * Get a post ID cutoff that freezes the cleanup candidate set.
 	 *
+	 * @throws RuntimeException When the cutoff cannot be read.
 	 * @return int Highest post ID present when cleanup starts.
 	 */
 	private static function get_import_cleanup_post_id_limit(): int {
 		global $wpdb;
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The primary-key maximum must reflect posts created by the import that just finished.
-		return absint( $wpdb->get_var( "SELECT MAX(ID) FROM {$wpdb->posts}" ) );
+		$post_id_limit = $wpdb->get_var( "SELECT MAX(ID) FROM {$wpdb->posts}" );
+		if ( $wpdb->last_error ) {
+			throw new RuntimeException( esc_html__( 'Import could not be completed. Please start again.', 'woocommerce' ) );
+		}
+
+		return absint( $post_id_limit );
+	}
+
+	/**
+	 * Extend ownership before an import batch can cross its expiration time.
+	 *
+	 * @param string $import_run_id Import run identifier.
+	 * @param int    $expires_at New ownership expiration.
+	 * @throws RuntimeException When ownership cannot be renewed.
+	 * @return void
+	 */
+	private static function renew_import_run_ownership( string $import_run_id, int $expires_at ): void {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- One atomic update keeps a near-expiry run from losing placeholders while its next batch executes.
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->postmeta} expiration INNER JOIN {$wpdb->postmeta} import_run ON import_run.post_id = expiration.post_id SET expiration.meta_value = GREATEST(CAST(expiration.meta_value AS UNSIGNED), %d) WHERE expiration.meta_key = %s AND import_run.meta_key = %s AND import_run.meta_value = %s",
+				$expires_at,
+				self::IMPORT_RUN_EXPIRATION_META_KEY,
+				self::IMPORT_RUN_META_KEY,
+				$import_run_id
+			)
+		);
+
+		if ( false === $updated ) {
+			throw new RuntimeException( esc_html__( 'Import could not be completed. Please start again.', 'woocommerce' ) );
+		}
+	}
+
+	/**
+	 * Atomically lease a post before cleanup mutates or deletes it.
+	 *
+	 * @param int    $post_id Post ID.
+	 * @param string $import_run_id Import run identifier.
+	 * @param int    $expires_at Lease expiration.
+	 * @throws RuntimeException When the ownership lease cannot be persisted.
+	 * @return bool Whether this run still owns the post.
+	 */
+	private static function claim_import_post( int $post_id, string $import_run_id, int $expires_at ): bool {
+		global $wpdb;
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- The unique owner check and lease extension must be atomic with expired-run adoption.
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->postmeta} expiration INNER JOIN {$wpdb->postmeta} import_run ON import_run.post_id = expiration.post_id LEFT JOIN {$wpdb->postmeta} other_import_run ON other_import_run.post_id = import_run.post_id AND other_import_run.meta_key = import_run.meta_key AND other_import_run.meta_id <> import_run.meta_id LEFT JOIN {$wpdb->postmeta} other_expiration ON other_expiration.post_id = expiration.post_id AND other_expiration.meta_key = expiration.meta_key AND other_expiration.meta_id <> expiration.meta_id SET expiration.meta_value = GREATEST(CAST(expiration.meta_value AS UNSIGNED), %d) WHERE expiration.post_id = %d AND expiration.meta_key = %s AND import_run.meta_key = %s AND import_run.meta_value = %s AND other_import_run.meta_id IS NULL AND other_expiration.meta_id IS NULL",
+				$expires_at,
+				$post_id,
+				self::IMPORT_RUN_EXPIRATION_META_KEY,
+				self::IMPORT_RUN_META_KEY,
+				$import_run_id
+			)
+		);
+		wp_cache_delete( $post_id, 'post_meta' );
+
+		if ( false === $updated ) {
+			// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The JSON response is rendered with jQuery .text().
+			throw new RuntimeException( __( 'Import cleanup could not be completed.', 'woocommerce' ) );
+		}
+
+		$current_owners = get_post_meta( $post_id, self::IMPORT_RUN_META_KEY, false );
+		if ( empty( $current_owners ) ) {
+			return false;
+		}
+		if ( 1 !== count( $current_owners ) || ! is_string( $current_owners[0] ) ) {
+			// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The JSON response is rendered with jQuery .text().
+			throw new RuntimeException( __( 'Import cleanup could not be completed.', 'woocommerce' ) );
+		}
+		if ( ! hash_equals( $import_run_id, $current_owners[0] ) ) {
+			return false;
+		}
+
+		$current_expirations = get_post_meta( $post_id, self::IMPORT_RUN_EXPIRATION_META_KEY, false );
+		if ( 1 !== count( $current_expirations ) || $expires_at > absint( $current_expirations[0] ) ) {
+			// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The JSON response is rendered with jQuery .text().
+			throw new RuntimeException( __( 'Import cleanup could not be completed.', 'woocommerce' ) );
+		}
+
+		return true;
 	}
 
 	/**
 	 * Remove one batch of temporary products and mapping data left by the importer.
 	 *
-	 * @param int $post_id_limit Highest post ID eligible for this cleanup run.
+	 * @param string $import_run_id Import run that owns the temporary data.
+	 * @param int    $post_id_limit Highest post ID eligible for this cleanup run.
+	 * @param int    $lease_expires_at Expiration for posts claimed by this cleanup request.
 	 * @throws RuntimeException When a placeholder cannot be deleted.
 	 * @return bool Whether all importer placeholders have been removed.
 	 */
-	private static function cleanup_after_import( int $post_id_limit ): bool {
+	private static function cleanup_after_import( string $import_run_id, int $post_id_limit, int $lease_expires_at ): bool {
 		global $wpdb;
 
 		$remaining_batch_size = self::IMPORT_CLEANUP_BATCH_SIZE;
 
-		// Delete products first so WooCommerce can remove their variations through the normal lifecycle.
-		foreach ( array( 'product', 'product_variation' ) as $post_type ) {
-			// Query the exact type and status so MySQL can use the wp_posts type_status_date index.
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		// Delete variations first so removing a parent cannot cascade into another import's variation.
+		foreach ( array( 'product_variation', 'product' ) as $post_type ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- Cleanup must select only placeholders owned by this import.
 			$post_ids = $wpdb->get_col(
 				$wpdb->prepare(
-					"SELECT ID FROM {$wpdb->posts} WHERE post_type = %s AND post_status = %s AND ID <= %d LIMIT %d",
+					"SELECT DISTINCT posts.ID FROM {$wpdb->posts} posts INNER JOIN {$wpdb->postmeta} import_run ON import_run.post_id = posts.ID WHERE posts.post_type = %s AND posts.post_status = %s AND posts.ID <= %d AND import_run.meta_key = %s AND import_run.meta_value = %s ORDER BY posts.ID ASC LIMIT %d",
 					$post_type,
 					'importing',
 					$post_id_limit,
+					self::IMPORT_RUN_META_KEY,
+					$import_run_id,
 					$remaining_batch_size + 1
 				)
 			);
+			if ( $wpdb->last_error ) {
+				// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The JSON response is rendered with jQuery .text().
+				throw new RuntimeException( __( 'Import cleanup could not be completed.', 'woocommerce' ) );
+			}
 			$has_more = count( $post_ids ) > $remaining_batch_size;
 			$post_ids = array_slice( $post_ids, 0, $remaining_batch_size );
 
@@ -372,10 +671,29 @@ class WC_Product_CSV_Importer_Controller {
 			}
 
 			foreach ( $post_ids as $post_id ) {
-				$post = get_post( $post_id );
-
-				if ( ! $post || $post_type !== $post->post_type || 'importing' !== $post->post_status ) {
+				if ( ! self::claim_import_post( absint( $post_id ), $import_run_id, $lease_expires_at ) ) {
 					continue;
+				}
+
+				$post          = get_post( $post_id );
+				$current_owner = get_post_meta( $post_id, self::IMPORT_RUN_META_KEY, true );
+
+				if ( ! $post || $post_type !== $post->post_type || 'importing' !== $post->post_status || ! is_string( $current_owner ) || ! hash_equals( $import_run_id, $current_owner ) ) {
+					continue;
+				}
+
+				if ( 'product' === $post_type ) {
+					// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Avoid cascading deletion into another import's variation.
+					$child_id = $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE post_parent = %d AND post_type = 'product_variation' LIMIT 1", $post_id ) );
+					// @phpstan-ignore-next-line if.alwaysFalse (Runtime database drivers can still report a query error.)
+					if ( $wpdb->last_error ) {
+						// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The JSON response is rendered with jQuery .text().
+						throw new RuntimeException( __( 'Import cleanup could not be completed.', 'woocommerce' ) );
+					}
+					if ( $child_id ) {
+						// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The JSON response is rendered with jQuery .text().
+						throw new RuntimeException( __( 'Import cleanup could not be completed.', 'woocommerce' ) );
+					}
 				}
 
 				wp_delete_post( absint( $post_id ), true );
@@ -393,36 +711,125 @@ class WC_Product_CSV_Importer_Controller {
 			}
 		}
 
-		// Remove mapping markers only after every frozen placeholder batch has completed.
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- The importer requires one uncached cleanup of its temporary mapping markers.
-		$wpdb->query(
+		// Remove this run's mapping and ownership markers only after its placeholders are gone.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- Cleanup must select only markers owned by this import.
+		$post_ids = $wpdb->get_col(
 			$wpdb->prepare(
-				"DELETE FROM {$wpdb->postmeta} WHERE meta_key = %s AND post_id <= %d",
-				'_original_id',
-				$post_id_limit
+				"SELECT DISTINCT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value = %s AND post_id <= %d ORDER BY post_id ASC LIMIT %d",
+				self::IMPORT_RUN_META_KEY,
+				$import_run_id,
+				$post_id_limit,
+				$remaining_batch_size + 1
 			)
 		);
+		// @phpstan-ignore-next-line if.alwaysFalse (Runtime database drivers can still report a query error.)
+		if ( $wpdb->last_error ) {
+			// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The JSON response is rendered with jQuery .text().
+			throw new RuntimeException( __( 'Import cleanup could not be completed.', 'woocommerce' ) );
+		}
+		$has_more = count( $post_ids ) > $remaining_batch_size;
+		$post_ids = array_slice( $post_ids, 0, $remaining_batch_size );
 
-		return true;
+		foreach ( $post_ids as $post_id ) {
+			if ( ! self::claim_import_post( absint( $post_id ), $import_run_id, $lease_expires_at ) ) {
+				continue;
+			}
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- Delete this uniquely owned run's related marker rows atomically after claiming the post.
+			$deleted = $wpdb->query(
+				$wpdb->prepare(
+					"DELETE markers FROM {$wpdb->postmeta} markers INNER JOIN {$wpdb->postmeta} import_run ON import_run.post_id = markers.post_id AND import_run.meta_key = %s AND import_run.meta_value = %s INNER JOIN {$wpdb->postmeta} expiration ON expiration.post_id = import_run.post_id AND expiration.meta_key = %s LEFT JOIN {$wpdb->postmeta} other_import_run ON other_import_run.post_id = import_run.post_id AND other_import_run.meta_key = import_run.meta_key AND other_import_run.meta_id <> import_run.meta_id LEFT JOIN {$wpdb->postmeta} other_expiration ON other_expiration.post_id = expiration.post_id AND other_expiration.meta_key = expiration.meta_key AND other_expiration.meta_id <> expiration.meta_id WHERE markers.post_id = %d AND other_import_run.meta_id IS NULL AND other_expiration.meta_id IS NULL AND ( markers.meta_key IN ( %s, %s ) OR ( markers.meta_key = %s AND markers.meta_value = %s ) )",
+					self::IMPORT_RUN_META_KEY,
+					$import_run_id,
+					self::IMPORT_RUN_EXPIRATION_META_KEY,
+					$post_id,
+					'_original_id',
+					self::IMPORT_RUN_EXPIRATION_META_KEY,
+					self::IMPORT_RUN_META_KEY,
+					$import_run_id
+				)
+			);
+			wp_cache_delete( $post_id, 'post_meta' );
+
+			if ( false === $deleted || metadata_exists( 'post', $post_id, '_original_id' ) || metadata_exists( 'post', $post_id, self::IMPORT_RUN_EXPIRATION_META_KEY ) || in_array( $import_run_id, get_post_meta( $post_id, self::IMPORT_RUN_META_KEY, false ), true ) ) {
+				// phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- The JSON response is rendered with jQuery .text().
+				throw new RuntimeException( __( 'Import cleanup could not be completed.', 'woocommerce' ) );
+			}
+		}
+
+		return ! $has_more;
 	}
 
 	/**
 	 * Processes AJAX requests related to a product CSV import.
 	 *
 	 * @since 9.3.0
+	 * @throws RuntimeException When request state is invalid.
+	 * @throws \Throwable When an import token cannot be replaced.
 	 */
 	public static function dispatch_ajax() {
 		check_ajax_referer( 'wc-product-import', 'security' );
+		$response               = array();
+		$error                  = null;
+		$cleanup_recovery_token = '';
+		$import_successor_token = '';
+		$import_successor_state = array();
 
 		try {
 			// PHPCS: input var ok.
-			$request_position = isset( $_POST['position'] ) ? wc_clean( wp_unslash( $_POST['position'] ) ) : 0;
-			$cleanup_pattern  = '/^' . preg_quote( self::IMPORT_CLEANUP_POSITION_PREFIX, '/' ) . '(\d+)$/';
+			$request_position     = isset( $_POST['position'] ) ? wc_clean( wp_unslash( $_POST['position'] ) ) : 0;
+			$file                 = wc_clean( wp_unslash( $_POST['file'] ?? '' ) );
+			$request_import_token = wc_clean( wp_unslash( $_POST['import_token'] ?? '' ) );
+			$delimiter            = ! empty( $_POST['delimiter'] ) ? wc_clean( wp_unslash( $_POST['delimiter'] ) ) : ',';
+			$mapping              = isset( $_POST['mapping'] ) ? (array) wc_clean( wp_unslash( $_POST['mapping'] ) ) : array();
+			$raw_update_existing  = isset( $_POST['update_existing'] ) ? wc_clean( wp_unslash( $_POST['update_existing'] ) ) : false;
+			$character_encoding   = isset( $_POST['character_encoding'] ) ? wc_clean( wp_unslash( $_POST['character_encoding'] ) ) : '';
+			$cleanup_pattern      = '/\A' . preg_quote( self::IMPORT_CLEANUP_POSITION_PREFIX, '/' ) . '([a-f0-9]{40})\z/';
+			$cleanup_token        = is_string( $request_position ) && preg_match( $cleanup_pattern, $request_position, $cleanup_matches ) ? $cleanup_matches[1] : '';
+			$is_import_position   = ( is_int( $request_position ) && 0 <= $request_position ) || ( is_string( $request_position ) && ctype_digit( $request_position ) );
 
-			if ( is_string( $request_position ) && preg_match( $cleanup_pattern, $request_position, $cleanup_matches ) ) {
-				$cleanup_complete = self::cleanup_after_import( absint( $cleanup_matches[1] ) );
-				$response         = array(
-					'position'            => $cleanup_complete ? 'done' : $request_position,
+			if (
+				! is_string( $file ) ||
+				! is_string( $request_import_token ) ||
+				! is_string( $delimiter ) ||
+				! is_string( $character_encoding ) ||
+				( ! is_string( $raw_update_existing ) && ! is_bool( $raw_update_existing ) ) ||
+				( is_string( $request_position ) && 0 === strpos( $request_position, self::IMPORT_CLEANUP_POSITION_PREFIX ) && ! $cleanup_token ) ||
+				( ! $cleanup_token && ! $is_import_position )
+			) {
+				throw new RuntimeException( esc_html__( 'Import could not be completed. Please start again.', 'woocommerce' ) );
+			}
+
+			$update_existing = wc_string_to_bool( $raw_update_existing );
+			$context_hash    = self::get_import_context_hash( $file, $mapping, $delimiter, $update_existing, $character_encoding );
+
+			if ( $cleanup_token ) {
+				if ( ! hash_equals( $request_import_token, $cleanup_token ) ) {
+					throw new RuntimeException( esc_html__( 'Import could not be completed. Please start again.', 'woocommerce' ) );
+				}
+
+				$state = self::get_import_state( $cleanup_token, $context_hash, 'cleanup' );
+				if ( ! isset( $state['post_id_limit'] ) ) {
+					throw new RuntimeException( esc_html__( 'Import could not be completed. Please start again.', 'woocommerce' ) );
+				}
+
+				$next_state               = $state;
+				$next_state['expires_at'] = time() + self::IMPORT_TOKEN_EXPIRATION;
+				$next_token               = self::create_import_token( $next_state, $cleanup_token );
+
+				try {
+					self::consume_import_token( $cleanup_token, $state );
+				} catch ( \Throwable $throwable ) {
+					delete_option( self::get_import_token_option_name( $next_token ) );
+					throw $throwable;
+				}
+
+				$cleanup_recovery_token = $next_token;
+
+				$cleanup_complete = self::cleanup_after_import( $state['run_id'], absint( $state['post_id_limit'] ), $next_state['expires_at'] );
+
+				$response = array(
+					'position'            => 'done',
 					'percentage'          => 100,
 					'imported'            => 0,
 					'imported_variations' => 0,
@@ -432,74 +839,134 @@ class WC_Product_CSV_Importer_Controller {
 				);
 
 				if ( $cleanup_complete ) {
+					delete_option( self::get_import_token_option_name( $next_token ) );
+					$cleanup_recovery_token = '';
+					if ( isset( $state['failure_message'] ) && is_string( $state['failure_message'] ) && $state['failure_message'] ) {
+						throw new RuntimeException( $state['failure_message'] );
+					}
 					$response['url'] = add_query_arg( array( '_wpnonce' => wp_create_nonce( 'woocommerce-csv-importer' ) ), admin_url( 'edit.php?post_type=product&page=product_importer&step=done' ) );
-				}
-
-				wp_send_json_success( $response );
-			}
-
-			$file = wc_clean( wp_unslash( $_POST['file'] ?? '' ) ); // PHPCS: input var ok.
-			self::validate_file_path( $file );
-
-			$params = array(
-				'delimiter'          => ! empty( $_POST['delimiter'] ) ? wc_clean( wp_unslash( $_POST['delimiter'] ) ) : ',', // PHPCS: input var ok.
-				'start_pos'          => absint( $request_position ),
-				'mapping'            => isset( $_POST['mapping'] ) ? (array) wc_clean( wp_unslash( $_POST['mapping'] ) ) : array(), // PHPCS: input var ok.
-				'update_existing'    => isset( $_POST['update_existing'] ) ? (bool) $_POST['update_existing'] : false, // PHPCS: input var ok.
-				'character_encoding' => isset( $_POST['character_encoding'] ) ? wc_clean( wp_unslash( $_POST['character_encoding'] ) ) : '',
-
-				/**
-				 * Batch size for the product import process.
-				 *
-				 * @param int $size Batch size.
-				 *
-				 * @since 3.1.0
-				 */
-				'lines'              => apply_filters( 'woocommerce_product_import_batch_size', 30 ),
-				'parse'              => true,
-			);
-
-			// Log failures.
-			if ( 0 !== $params['start_pos'] ) {
-				$error_log = array_filter( (array) get_user_option( 'product_import_error_log' ) );
-			} else {
-				$error_log = array();
-			}
-
-			include_once WC_ABSPATH . 'includes/import/class-wc-product-csv-importer.php';
-
-			$importer         = self::get_importer( $file, $params );
-			$results          = $importer->import();
-			$percent_complete = $importer->get_percent_complete();
-			$error_log        = array_merge( $error_log, $results['failed'], $results['skipped'] );
-
-			update_user_option( get_current_user_id(), 'product_import_error_log', $error_log );
-
-			$response = array(
-				'position'            => $importer->get_file_position(),
-				'percentage'          => $percent_complete,
-				'imported'            => is_countable( $results['imported'] ) ? count( $results['imported'] ) : 0,
-				'imported_variations' => is_countable( $results['imported_variations'] ) ? count( $results['imported_variations'] ) : 0,
-				'failed'              => is_countable( $results['failed'] ) ? count( $results['failed'] ) : 0,
-				'updated'             => is_countable( $results['updated'] ) ? count( $results['updated'] ) : 0,
-				'skipped'             => is_countable( $results['skipped'] ) ? count( $results['skipped'] ) : 0,
-			);
-
-			if ( 100 === $percent_complete ) {
-				$post_id_limit = self::get_import_cleanup_post_id_limit();
-
-				if ( self::cleanup_after_import( $post_id_limit ) ) {
-					$response['position'] = 'done';
-					$response['url']      = add_query_arg( array( '_wpnonce' => wp_create_nonce( 'woocommerce-csv-importer' ) ), admin_url( 'edit.php?post_type=product&page=product_importer&step=done' ) );
 				} else {
-					$response['position'] = self::IMPORT_CLEANUP_POSITION_PREFIX . $post_id_limit;
+					$response['position']     = self::IMPORT_CLEANUP_POSITION_PREFIX . $next_token;
+					$response['import_token'] = $next_token;
+				}
+			} else {
+				$state    = self::get_import_state( $request_import_token, $context_hash, 'import' );
+				$position = absint( $request_position );
+				if ( ! isset( $state['position'] ) || ! is_int( $state['position'] ) || $position !== $state['position'] ) {
+					throw new RuntimeException( esc_html__( 'Import could not be completed. Please start again.', 'woocommerce' ) );
+				}
+
+				self::validate_file_path( $file );
+				$next_expiration = absint( $state['expires_at'] );
+				if ( $next_expiration - time() < self::IMPORT_REQUEST_GRACE_PERIOD ) {
+					$next_expiration = time() + self::IMPORT_TOKEN_EXPIRATION;
+					self::renew_import_run_ownership( $state['run_id'], $next_expiration );
+				}
+				$recovery_state               = $state;
+				$recovery_state['expires_at'] = $next_expiration;
+				$recovery_token               = self::create_import_token( $recovery_state, $request_import_token );
+
+				try {
+					self::consume_import_token( $request_import_token, $state );
+				} catch ( \Throwable $throwable ) {
+					delete_option( self::get_import_token_option_name( $recovery_token ) );
+					throw $throwable;
+				}
+
+				$import_successor_token = $recovery_token;
+				$import_successor_state = $recovery_state;
+				$state                  = $recovery_state;
+
+				$params = array(
+					'delimiter'             => $delimiter,
+					'start_pos'             => $position,
+					'mapping'               => $mapping,
+					'update_existing'       => $update_existing,
+					'character_encoding'    => $character_encoding,
+					'import_run_id'         => $state['run_id'],
+					'import_run_expires_at' => $state['expires_at'],
+
+					/**
+					 * Batch size for the product import process.
+					 *
+					 * @param int $size Batch size.
+					 *
+					 * @since 3.1.0
+					 */
+					'lines'                 => apply_filters( 'woocommerce_product_import_batch_size', 30 ),
+					'parse'                 => true,
+				);
+
+				// Log failures.
+				if ( 0 !== $params['start_pos'] ) {
+					$error_log = array_filter( (array) get_user_option( 'product_import_error_log' ) );
+				} else {
+					$error_log = array();
+				}
+
+				include_once WC_ABSPATH . 'includes/import/class-wc-product-csv-importer.php';
+
+				$importer         = self::get_importer( $file, $params );
+				$results          = $importer->import();
+				$percent_complete = $importer->get_percent_complete();
+				$error_log        = array_merge( $error_log, $results['failed'], $results['skipped'] );
+
+				update_user_option( get_current_user_id(), 'product_import_error_log', $error_log );
+
+				$response = array(
+					'position'            => $importer->get_file_position(),
+					'percentage'          => $percent_complete,
+					'imported'            => is_countable( $results['imported'] ) ? count( $results['imported'] ) : 0,
+					'imported_variations' => is_countable( $results['imported_variations'] ) ? count( $results['imported_variations'] ) : 0,
+					'failed'              => is_countable( $results['failed'] ) ? count( $results['failed'] ) : 0,
+					'updated'             => is_countable( $results['updated'] ) ? count( $results['updated'] ) : 0,
+					'skipped'             => is_countable( $results['skipped'] ) ? count( $results['skipped'] ) : 0,
+				);
+
+				$next_state = $state;
+				if ( 100 === $percent_complete ) {
+					$next_state['phase']         = 'cleanup';
+					$next_state['post_id_limit'] = self::get_import_cleanup_post_id_limit();
+					unset( $next_state['position'] );
+				} else {
+					$next_state['position'] = $response['position'];
+				}
+
+				self::replace_import_token_state( $recovery_token, $recovery_state, $next_state );
+				$response['import_token'] = $recovery_token;
+				if ( 100 === $percent_complete ) {
+					$response['position'] = self::IMPORT_CLEANUP_POSITION_PREFIX . $recovery_token;
+				}
+				$import_successor_token = '';
+				$import_successor_state = array();
+			}
+		} catch ( \Throwable $e ) {
+			$error = array( 'message' => $e->getMessage() );
+			if ( $import_successor_token ) {
+				try {
+					$cleanup_state                    = $import_successor_state;
+					$cleanup_state['phase']           = 'cleanup';
+					$cleanup_state['expires_at']      = time() + self::IMPORT_TOKEN_EXPIRATION;
+					$cleanup_state['post_id_limit']   = self::get_import_cleanup_post_id_limit();
+					$cleanup_state['failure_message'] = $e->getMessage();
+					unset( $cleanup_state['position'] );
+					self::replace_import_token_state( $import_successor_token, $import_successor_state, $cleanup_state );
+					$cleanup_recovery_token = $import_successor_token;
+				} catch ( \Throwable $cleanup_error ) {
+					delete_option( self::get_import_token_option_name( $import_successor_token ) );
 				}
 			}
-
-			wp_send_json_success( $response );
-		} catch ( \Exception $e ) {
-			wp_send_json_error( array( 'message' => $e->getMessage() ) );
+			if ( $cleanup_recovery_token ) {
+				$error['position']     = self::IMPORT_CLEANUP_POSITION_PREFIX . $cleanup_recovery_token;
+				$error['import_token'] = $cleanup_recovery_token;
+			}
 		}
+
+		if ( null !== $error ) {
+			wp_send_json_error( $error );
+		}
+
+		wp_send_json_success( $response );
 	}
 
 	/**
@@ -615,15 +1082,26 @@ class WC_Product_CSV_Importer_Controller {
 			exit;
 		}
 
+		$mapping = array(
+			'from' => (array) $mapping_from,
+			'to'   => (array) $mapping_to,
+		);
+		$state   = array(
+			'user_id'      => get_current_user_id(),
+			'context_hash' => self::get_import_context_hash( $this->file, $mapping, $this->delimiter, $this->update_existing, $this->character_encoding ),
+			'run_id'       => wc_rand_hash(),
+			'phase'        => 'import',
+			'expires_at'   => time() + self::IMPORT_TOKEN_EXPIRATION,
+			'position'     => 0,
+		);
+
 		wp_localize_script(
 			'wc-product-import',
 			'wc_product_import_params',
 			array(
 				'import_nonce'       => wp_create_nonce( 'wc-product-import' ),
-				'mapping'            => array(
-					'from' => $mapping_from,
-					'to'   => $mapping_to,
-				),
+				'import_token'       => self::create_import_token( $state ),
+				'mapping'            => $mapping,
 				'file'               => $this->file,
 				'update_existing'    => $this->update_existing,
 				'delimiter'          => $this->delimiter,

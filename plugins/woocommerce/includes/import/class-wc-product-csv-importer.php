@@ -34,6 +34,21 @@ if ( ! class_exists( 'WC_Product_CSV_Importer_Controller', false ) ) {
 class WC_Product_CSV_Importer extends WC_Product_Importer {
 
 	/**
+	 * Meta key used to associate temporary products with an import run.
+	 */
+	private const IMPORT_RUN_META_KEY = '_wc_product_csv_import_run_id';
+
+	/**
+	 * Meta key that records when temporary import ownership expires.
+	 */
+	private const IMPORT_RUN_EXPIRATION_META_KEY = '_wc_product_csv_import_run_expires_at';
+
+	/**
+	 * Delay unscoped ownership release long enough for an admitted request to finish.
+	 */
+	private const IMPORT_RUN_EXPIRATION_GRACE_PERIOD = HOUR_IN_SECONDS;
+
+	/**
 	 * Tracks current row being parsed.
 	 *
 	 * @var integer
@@ -74,6 +89,7 @@ class WC_Product_CSV_Importer extends WC_Product_Importer {
 			'prevent_timeouts' => true, // Check memory and time usage and abort if reaching limit.
 			'enclosure'        => '"', // The character used to wrap text in the CSV.
 			'escape'           => "\0", // PHP uses '\' as the default escape character. This is not RFC-4180 compliant. This disables the escape character.
+			'import_run_id'    => '',
 		);
 
 		$this->params = wp_parse_args( $params, $default_args );
@@ -221,7 +237,64 @@ class WC_Product_CSV_Importer extends WC_Product_Importer {
 			return $this->original_id_map[ $original_id ];
 		}
 
-		$product_id = absint( $wpdb->get_var( $wpdb->prepare( "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_original_id' AND meta_value = %s;", $original_id ) ) );
+		$import_run_id = $this->get_import_run_id();
+		if ( $import_run_id ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- The importer needs a fresh lookup scoped to its placeholders while preserving completed mappings created by programmatic imports.
+			$product_id = absint(
+				$wpdb->get_var(
+					$wpdb->prepare(
+						"SELECT original_id.post_id FROM {$wpdb->postmeta} original_id INNER JOIN {$wpdb->posts} posts ON posts.ID = original_id.post_id LEFT JOIN {$wpdb->postmeta} import_run ON import_run.post_id = original_id.post_id AND import_run.meta_key = %s WHERE original_id.meta_key = '_original_id' AND original_id.meta_value = %s AND ( import_run.meta_value = %s OR ( import_run.post_id IS NULL AND posts.post_status <> 'importing' ) ) ORDER BY import_run.meta_value = %s DESC LIMIT 1",
+						self::IMPORT_RUN_META_KEY,
+						$original_id,
+						$import_run_id,
+						$import_run_id
+					)
+				)
+			);
+			$this->throw_on_original_id_lookup_error();
+
+			if ( $product_id && $this->is_foreign_import_placeholder( $product_id ) ) {
+				$product_id = 0;
+			}
+
+			if ( ! $product_id ) {
+				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- Expired ownership may be transferred so an abandoned mapping does not block a later import.
+				$expired_product_id = absint(
+					$wpdb->get_var(
+						$wpdb->prepare(
+							"SELECT original_id.post_id FROM {$wpdb->postmeta} original_id INNER JOIN {$wpdb->postmeta} import_run ON import_run.post_id = original_id.post_id INNER JOIN {$wpdb->postmeta} expiration ON expiration.post_id = original_id.post_id WHERE original_id.meta_key = '_original_id' AND original_id.meta_value = %s AND import_run.meta_key = %s AND expiration.meta_key = %s AND CAST(expiration.meta_value AS UNSIGNED) <= %d LIMIT 1",
+							$original_id,
+							self::IMPORT_RUN_META_KEY,
+							self::IMPORT_RUN_EXPIRATION_META_KEY,
+							time()
+						)
+					)
+				);
+				$this->throw_on_original_id_lookup_error();
+
+				if ( $expired_product_id && $this->adopt_expired_import_product( $expired_product_id ) ) {
+					$product_id = $expired_product_id;
+				}
+			}
+		} else {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- Programmatic importers may use unowned mappings or release expired ownership after an in-flight request grace period.
+			$product_id = absint(
+				$wpdb->get_var(
+					$wpdb->prepare(
+						"SELECT original_id.post_id FROM {$wpdb->postmeta} original_id LEFT JOIN {$wpdb->postmeta} import_run ON import_run.post_id = original_id.post_id AND import_run.meta_key = %s LEFT JOIN {$wpdb->postmeta} expiration ON expiration.post_id = original_id.post_id AND expiration.meta_key = %s WHERE original_id.meta_key = '_original_id' AND original_id.meta_value = %s AND ( import_run.post_id IS NULL OR CAST(expiration.meta_value AS UNSIGNED) <= %d ) ORDER BY import_run.post_id IS NULL DESC LIMIT 1",
+						self::IMPORT_RUN_META_KEY,
+						self::IMPORT_RUN_EXPIRATION_META_KEY,
+						$original_id,
+						time() - self::IMPORT_RUN_EXPIRATION_GRACE_PERIOD
+					)
+				)
+			);
+			$this->throw_on_original_id_lookup_error();
+
+			if ( $product_id && $this->is_foreign_import_placeholder( $product_id ) ) {
+				$product_id = 0;
+			}
+		}
 
 		if ( $product_id ) {
 			$this->original_id_map[ $original_id ] = $product_id;
@@ -242,6 +315,247 @@ class WC_Product_CSV_Importer extends WC_Product_Importer {
 
 		if ( $original_id && $product_id ) {
 			$this->original_id_map[ $original_id ] = $product_id;
+		}
+	}
+
+	/**
+	 * Stop an import when its mapping lookup failed.
+	 *
+	 * @throws RuntimeException When the database reports a lookup error.
+	 * @return void
+	 */
+	private function throw_on_original_id_lookup_error(): void {
+		global $wpdb;
+
+		if ( $wpdb->last_error ) {
+			throw new RuntimeException( esc_html__( 'Import could not be completed. Please start again.', 'woocommerce' ) );
+		}
+	}
+
+	/**
+	 * Get the server-generated identifier for this import run.
+	 *
+	 * @return string Import run identifier, or an empty string when none was supplied.
+	 */
+	private function get_import_run_id(): string {
+		$import_run_id = isset( $this->params['import_run_id'] ) && is_string( $this->params['import_run_id'] ) ? $this->params['import_run_id'] : '';
+
+		return 40 === strlen( $import_run_id ) && ctype_xdigit( $import_run_id ) && time() < $this->get_import_run_expiration() ? $import_run_id : '';
+	}
+
+	/**
+	 * Get the expiration time for temporary data created by this import run.
+	 *
+	 * @return int Unix timestamp, or zero when the importer has no run expiration.
+	 */
+	private function get_import_run_expiration(): int {
+		return isset( $this->params['import_run_expires_at'] ) ? absint( $this->params['import_run_expires_at'] ) : 0;
+	}
+
+	/**
+	 * Transfer an expired placeholder or mapping to this import run.
+	 *
+	 * @param int $product_id Product or variation ID.
+	 * @return bool Whether ownership was transferred.
+	 */
+	private function adopt_expired_import_product( $product_id ): bool {
+		global $wpdb;
+
+		$import_run_id         = $this->get_import_run_id();
+		$import_run_expires_at = $this->get_import_run_expiration();
+		$current_owner         = get_post_meta( $product_id, self::IMPORT_RUN_META_KEY, true );
+
+		if ( ! $import_run_id || ! $import_run_expires_at || ! is_string( $current_owner ) || ! $current_owner ) {
+			return false;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- Compare-and-swap prevents two imports from adopting the same uniquely owned expired mapping.
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->postmeta} import_run INNER JOIN {$wpdb->postmeta} expiration ON expiration.post_id = import_run.post_id LEFT JOIN {$wpdb->postmeta} other_import_run ON other_import_run.post_id = import_run.post_id AND other_import_run.meta_key = import_run.meta_key AND other_import_run.meta_id <> import_run.meta_id LEFT JOIN {$wpdb->postmeta} other_expiration ON other_expiration.post_id = expiration.post_id AND other_expiration.meta_key = expiration.meta_key AND other_expiration.meta_id <> expiration.meta_id SET import_run.meta_value = %s, expiration.meta_value = %d WHERE import_run.post_id = %d AND import_run.meta_key = %s AND import_run.meta_value = %s AND expiration.meta_key = %s AND CAST(expiration.meta_value AS UNSIGNED) <= %d AND other_import_run.meta_id IS NULL AND other_expiration.meta_id IS NULL",
+				$import_run_id,
+				$import_run_expires_at,
+				$product_id,
+				self::IMPORT_RUN_META_KEY,
+				$current_owner,
+				self::IMPORT_RUN_EXPIRATION_META_KEY,
+				time()
+			)
+		);
+		wp_cache_delete( $product_id, 'post_meta' );
+
+		if ( 0 >= $updated ) {
+			return false;
+		}
+
+		$current_owners      = get_post_meta( $product_id, self::IMPORT_RUN_META_KEY, false );
+		$current_expirations = get_post_meta( $product_id, self::IMPORT_RUN_EXPIRATION_META_KEY, false );
+
+		return 1 === count( $current_owners ) && is_string( $current_owners[0] ) && hash_equals( $import_run_id, $current_owners[0] ) && 1 === count( $current_expirations ) && absint( $current_expirations[0] ) === $import_run_expires_at;
+	}
+
+	/**
+	 * Release expired ownership for an importer without server-managed run state.
+	 *
+	 * @param int $product_id Product or variation ID.
+	 * @return bool Whether no import run owns the product now.
+	 */
+	private function release_expired_import_product( $product_id ): bool {
+		global $wpdb;
+
+		$current_owner = get_post_meta( $product_id, self::IMPORT_RUN_META_KEY, true );
+		if ( ! is_string( $current_owner ) || ! $current_owner ) {
+			return true;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.SlowDBQuery.slow_db_query_meta_key, WordPress.DB.SlowDBQuery.slow_db_query_meta_value -- Compare-and-delete releases a unique ownership pair only after its grace period.
+		$deleted = $wpdb->query(
+			$wpdb->prepare(
+				"DELETE import_run, expiration FROM {$wpdb->postmeta} import_run INNER JOIN {$wpdb->postmeta} expiration ON expiration.post_id = import_run.post_id LEFT JOIN {$wpdb->postmeta} other_import_run ON other_import_run.post_id = import_run.post_id AND other_import_run.meta_key = import_run.meta_key AND other_import_run.meta_id <> import_run.meta_id LEFT JOIN {$wpdb->postmeta} other_expiration ON other_expiration.post_id = expiration.post_id AND other_expiration.meta_key = expiration.meta_key AND other_expiration.meta_id <> expiration.meta_id WHERE import_run.post_id = %d AND import_run.meta_key = %s AND import_run.meta_value = %s AND expiration.meta_key = %s AND CAST(expiration.meta_value AS UNSIGNED) <= %d AND other_import_run.meta_id IS NULL AND other_expiration.meta_id IS NULL",
+				$product_id,
+				self::IMPORT_RUN_META_KEY,
+				$current_owner,
+				self::IMPORT_RUN_EXPIRATION_META_KEY,
+				time() - self::IMPORT_RUN_EXPIRATION_GRACE_PERIOD
+			)
+		);
+		wp_cache_delete( $product_id, 'post_meta' );
+
+		return false !== $deleted && ! get_post_meta( $product_id, self::IMPORT_RUN_META_KEY, true );
+	}
+
+	/**
+	 * Check whether an importing product belongs to a different import run.
+	 *
+	 * @param int $product_id Product ID.
+	 * @return bool Whether the product is a placeholder owned by another import.
+	 */
+	private function is_foreign_import_placeholder( $product_id ): bool {
+		$import_run_id = $this->get_import_run_id();
+		$product       = wc_get_product( $product_id );
+
+		if ( ! $product || 'importing' !== $product->get_status() ) {
+			return false;
+		}
+
+		$owners = get_post_meta( $product_id, self::IMPORT_RUN_META_KEY, false );
+
+		if ( ! $import_run_id ) {
+			if ( empty( $owners ) ) {
+				return false;
+			}
+			if ( 1 !== count( $owners ) || ! is_string( $owners[0] ) || ! $owners[0] ) {
+				return true;
+			}
+
+			return ! $this->release_expired_import_product( $product_id );
+		}
+
+		if ( 1 !== count( $owners ) || ! is_string( $owners[0] ) || ! $owners[0] ) {
+			return true;
+		}
+		if ( hash_equals( $import_run_id, $owners[0] ) ) {
+			$expirations = get_post_meta( $product_id, self::IMPORT_RUN_EXPIRATION_META_KEY, false );
+
+			return 1 !== count( $expirations ) || time() >= absint( $expirations[0] );
+		}
+
+		return ! $this->adopt_expired_import_product( $product_id );
+	}
+
+	/**
+	 * Prepare a product without claiming another import run's placeholder.
+	 *
+	 * @param array $data Item data.
+	 * @return WC_Product|WP_Error
+	 */
+	protected function get_product_object( $data ) {
+		$product_id = isset( $data['id'] ) ? absint( $data['id'] ) : 0;
+
+		if ( $product_id && $this->is_foreign_import_placeholder( $product_id ) ) {
+			return new WP_Error(
+				'woocommerce_product_importer_error',
+				esc_html__( 'A product with this ID already exists.', 'woocommerce' ),
+				array( 'id' => $product_id )
+			);
+		}
+
+		$product = parent::get_product_object( $data );
+		if ( $product instanceof WC_Product && $product->get_id() && $this->is_foreign_import_placeholder( $product->get_id() ) ) {
+			return new WP_Error(
+				'woocommerce_product_importer_error',
+				esc_html__( 'A product with this ID already exists.', 'woocommerce' ),
+				array( 'id' => $product->get_id() )
+			);
+		}
+
+		return $product;
+	}
+
+	/**
+	 * Process an item without allowing the pre-insert filter to cross import runs.
+	 *
+	 * @param array $data Item data.
+	 * @return array|WP_Error
+	 */
+	protected function process_item( $data ) {
+		$validate_product = function ( $product ) {
+			if ( $product instanceof WC_Product && $product->get_id() && $this->is_foreign_import_placeholder( $product->get_id() ) ) {
+				throw new Exception( esc_html__( 'A product with this ID already exists.', 'woocommerce' ) );
+			}
+
+			return $product;
+		};
+		add_filter( 'woocommerce_product_import_pre_insert_product_object', $validate_product, PHP_INT_MAX );
+
+		try {
+			return parent::process_item( $data );
+		} finally {
+			remove_filter( 'woocommerce_product_import_pre_insert_product_object', $validate_product, PHP_INT_MAX );
+		}
+	}
+
+	/**
+	 * Mark a product as a temporary placeholder owned by this import run.
+	 *
+	 * @param WC_Product $product Product being prepared as a placeholder.
+	 * @return void
+	 */
+	private function prepare_placeholder_product( WC_Product $product ): void {
+		$product->set_status( 'importing' );
+
+		$import_run_id = $this->get_import_run_id();
+		if ( $import_run_id ) {
+			$product->add_meta_data( self::IMPORT_RUN_META_KEY, $import_run_id, true );
+			$product->add_meta_data( self::IMPORT_RUN_EXPIRATION_META_KEY, (string) $this->get_import_run_expiration(), true );
+		}
+	}
+
+	/**
+	 * Set imported metadata without allowing CSV data to replace placeholder ownership.
+	 *
+	 * @param WC_Product $product Product instance.
+	 * @param array      $data Item data.
+	 * @return void
+	 */
+	protected function set_meta_data( &$product, $data ) {
+		$import_run_id = $this->get_import_run_id();
+		$current_owner = $import_run_id ? $product->get_meta( self::IMPORT_RUN_META_KEY ) : '';
+
+		if ( $import_run_id && isset( $data['meta_data'] ) && is_array( $data['meta_data'] ) ) {
+			$data['meta_data'] = array_filter(
+				$data['meta_data'],
+				static function ( $meta ): bool {
+					return ! is_array( $meta ) || ! isset( $meta['key'] ) || ! in_array( $meta['key'], array( self::IMPORT_RUN_META_KEY, self::IMPORT_RUN_EXPIRATION_META_KEY ), true );
+				}
+			);
+		}
+
+		parent::set_meta_data( $product, $data );
+
+		if ( is_string( $current_owner ) && $current_owner && hash_equals( $import_run_id, $current_owner ) ) {
+			$product->update_meta_data( self::IMPORT_RUN_META_KEY, $import_run_id );
+			$product->update_meta_data( self::IMPORT_RUN_EXPIRATION_META_KEY, (string) $this->get_import_run_expiration() );
 		}
 	}
 
@@ -281,15 +595,19 @@ class WC_Product_CSV_Importer extends WC_Product_Importer {
 			// See if the given ID maps to a valid product already.
 			$existing_id = $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE post_type IN ( 'product', 'product_variation' ) AND ID = %d;", $id ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The importer requires a fresh indexed ID lookup that may include newly created placeholders.
 
-			if ( $existing_id ) {
+			if ( $existing_id && ! $this->is_foreign_import_placeholder( $existing_id ) ) {
 				return absint( $existing_id );
+			}
+
+			if ( $existing_id && $this->params['update_existing'] ) {
+				return '';
 			}
 
 			// If we're not updating existing posts, we may need a placeholder product to map to.
 			if ( ! $this->params['update_existing'] ) {
 				$product = wc_get_product_object( ProductType::SIMPLE );
 				$product->set_name( 'Import placeholder for ' . $id );
-				$product->set_status( 'importing' );
+				$this->prepare_placeholder_product( $product );
 				$product->add_meta_data( '_original_id', $id, true );
 				$placeholder_id = $product->save();
 				$this->remember_original_id_mapping( $id, $placeholder_id );
@@ -302,14 +620,18 @@ class WC_Product_CSV_Importer extends WC_Product_Importer {
 
 		$id = wc_get_product_id_by_sku( $value );
 
-		if ( $id ) {
+		if ( $id && ! $this->is_foreign_import_placeholder( $id ) ) {
 			return $id;
+		}
+
+		if ( $id ) {
+			return '';
 		}
 
 		try {
 			$product = wc_get_product_object( ProductType::SIMPLE );
 			$product->set_name( 'Import placeholder for ' . $value );
-			$product->set_status( 'importing' );
+			$this->prepare_placeholder_product( $product );
 			$product->set_sku( $value );
 			$id = $product->save();
 
@@ -355,13 +677,17 @@ class WC_Product_CSV_Importer extends WC_Product_Importer {
 			$id_from_sku      = $row_sku ? wc_get_product_id_by_sku( $row_sku ) : '';
 
 			// If row has a SKU, make sure placeholder was not made already.
-			if ( $id_from_sku ) {
+			if ( $id_from_sku && ! $this->is_foreign_import_placeholder( $id_from_sku ) ) {
 				return $id_from_sku;
+			}
+
+			if ( $id_from_sku ) {
+				return 0;
 			}
 
 			$product = wc_get_product_object( ProductType::SIMPLE );
 			$product->set_name( 'Import placeholder for ' . $id );
-			$product->set_status( 'importing' );
+			$this->prepare_placeholder_product( $product );
 			$product->add_meta_data( '_original_id', $id, true );
 
 			// If row has a SKU, make sure placeholder has it too.

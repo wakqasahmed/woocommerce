@@ -134,7 +134,7 @@ class WC_Product_CSV_Importer_Test extends \WC_Unit_Test_Case {
 		$existing_product = WC_Helper_Product::create_simple_product();
 		$query_count      = 0;
 		$count_query      = static function ( $query ) use ( &$query_count ) {
-			if ( false !== strpos( $query, 'SELECT post_id' ) && false !== strpos( $query, "meta_key = '_original_id'" ) ) {
+			if ( ( false !== strpos( $query, 'SELECT post_id' ) || false !== strpos( $query, 'SELECT original_id.post_id' ) ) && false !== strpos( $query, "meta_key = '_original_id'" ) ) {
 				++$query_count;
 			}
 
@@ -166,6 +166,461 @@ class WC_Product_CSV_Importer_Test extends \WC_Unit_Test_Case {
 				WC_Helper_Product::delete_product( $referenced_product_id );
 			}
 		}
+	}
+
+	/**
+	 * @testdox Original ID database errors should not create a replacement mapping.
+	 */
+	public function test_original_id_lookup_database_error_fails_import(): void {
+		global $wpdb;
+
+		$importer   = new WC_Product_CSV_Importer( __DIR__ . '/sample.csv' );
+		$fail_query = static function ( $query ) use ( $wpdb ) {
+			return false !== strpos( $query, 'SELECT original_id.post_id' ) ? "SELECT missing_import_column FROM {$wpdb->postmeta}" : $query;
+		};
+		add_filter( 'query', $fail_query );
+		$previous_suppress_errors = $wpdb->suppress_errors();
+
+		try {
+			$this->expectException( RuntimeException::class );
+			$this->expectExceptionMessage( 'Import could not be completed. Please start again.' );
+			$importer->parse_relative_field( 'id:987654344' );
+		} finally {
+			$wpdb->suppress_errors( $previous_suppress_errors );
+			remove_filter( 'query', $fail_query );
+		}
+	}
+
+	/**
+	 * @testdox Active imports should not reuse each other's placeholders.
+	 */
+	public function test_import_run_owns_its_placeholders(): void {
+		$run_a           = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+		$run_b           = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+		$expires_at      = time() + DAY_IN_SECONDS;
+		$original_id     = 987654333;
+		$row_original_id = 987654334;
+		$sku             = 'IMPORT-RUN-' . wp_generate_uuid4();
+		$importer_a      = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $run_a,
+				'import_run_expires_at' => $expires_at,
+			)
+		);
+		$importer_b      = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $run_b,
+				'import_run_expires_at' => $expires_at,
+			)
+		);
+		$legacy_importer = new WC_Product_CSV_Importer( __DIR__ . '/sample.csv' );
+
+		$run_a_original  = $importer_a->parse_relative_field( 'id:' . $original_id );
+		$run_b_original  = $importer_b->parse_relative_field( 'id:' . $original_id );
+		$run_a_sku       = $importer_a->parse_relative_field( $sku );
+		$run_a_row       = $importer_a->parse_id_field( (string) $row_original_id );
+		$legacy_original = $legacy_importer->parse_relative_field( 'id:' . $original_id );
+
+		$this->assertNotSame( $run_a_original, $run_b_original );
+		$this->assertNotSame( $run_a_original, $legacy_original );
+		$this->assertSame( '', $importer_b->parse_relative_field( $sku ) );
+		$this->assertSame( '', $legacy_importer->parse_relative_field( $sku ) );
+		$this->assertSame( $run_a, get_post_meta( $run_a_original, '_wc_product_csv_import_run_id', true ) );
+		$this->assertSame( $run_b, get_post_meta( $run_b_original, '_wc_product_csv_import_run_id', true ) );
+		$this->assertSame( $run_a, get_post_meta( $run_a_sku, '_wc_product_csv_import_run_id', true ) );
+		$this->assertSame( $run_a, get_post_meta( $run_a_row, '_wc_product_csv_import_run_id', true ) );
+		$this->assertSame( $expires_at, absint( get_post_meta( $run_a_original, '_wc_product_csv_import_run_expires_at', true ) ) );
+		$this->assertSame( '', get_post_meta( $legacy_original, '_wc_product_csv_import_run_id', true ) );
+	}
+
+	/**
+	 * @testdox Incomplete import ownership arguments should not reserve placeholders.
+	 */
+	public function test_import_run_requires_a_valid_future_expiration(): void {
+		$importer       = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array( 'import_run_id' => 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' )
+		);
+		$placeholder_id = $importer->parse_relative_field( 'id:987654337' );
+
+		$this->assertSame( '', get_post_meta( $placeholder_id, '_wc_product_csv_import_run_id', true ) );
+		$this->assertSame( '', get_post_meta( $placeholder_id, '_wc_product_csv_import_run_expires_at', true ) );
+	}
+
+	/**
+	 * @testdox Server-managed imports preserve completed mappings created by programmatic imports.
+	 */
+	public function test_import_run_reuses_completed_unowned_mapping(): void {
+		$original_id = 987654340;
+		$product     = WC_Helper_Product::create_simple_product();
+		add_post_meta( $product->get_id(), '_original_id', $original_id, true );
+		$scoped = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+				'import_run_expires_at' => time() + DAY_IN_SECONDS,
+			)
+		);
+
+		try {
+			$this->assertSame( $product->get_id(), $scoped->parse_relative_field( 'id:' . $original_id ) );
+			$this->assertSame( '', get_post_meta( $product->get_id(), '_wc_product_csv_import_run_id', true ) );
+		} finally {
+			WC_Helper_Product::delete_product( $product->get_id() );
+		}
+	}
+
+	/**
+	 * @testdox Filtered row data cannot claim another active import's placeholder.
+	 */
+	public function test_filtered_row_cannot_claim_foreign_import_placeholder(): void {
+		$run_a           = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+		$run_b           = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+		$expires_at      = time() + DAY_IN_SECONDS;
+		$sku             = 'FILTERED-IMPORT-RUN-' . wp_generate_uuid4();
+		$importer_a      = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $run_a,
+				'import_run_expires_at' => $expires_at,
+			)
+		);
+		$placeholder_id  = $importer_a->parse_relative_field( $sku );
+		$importer_b      = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $run_b,
+				'import_run_expires_at' => $expires_at,
+				'prevent_timeouts'      => false,
+			)
+		);
+		$parsed_data     = new ReflectionProperty( WC_Product_Importer::class, 'parsed_data' );
+		$add_foreign_sku = static function ( $data ) use ( $sku ) {
+			$data['sku'] = $sku;
+
+			return $data;
+		};
+
+		$parsed_data->setAccessible( true );
+		$parsed_data->setValue(
+			$importer_b,
+			array(
+				array(
+					'name' => 'Filtered product',
+					'type' => ProductType::SIMPLE,
+				),
+			)
+		);
+		add_filter( 'woocommerce_product_import_process_item_data', $add_foreign_sku );
+
+		try {
+			$result      = $importer_b->import();
+			$placeholder = wc_get_product( $placeholder_id );
+
+			$this->assertCount( 1, $result['failed'] );
+			$this->assertEmpty( $result['imported'] );
+			$this->assertSame( 'importing', $placeholder->get_status() );
+			$this->assertSame( $run_a, $placeholder->get_meta( '_wc_product_csv_import_run_id' ) );
+		} finally {
+			remove_filter( 'woocommerce_product_import_process_item_data', $add_foreign_sku );
+			WC_Helper_Product::delete_product( $placeholder_id );
+		}
+	}
+
+	/**
+	 * @testdox Filtered product objects cannot replace a row with another import's placeholder.
+	 */
+	public function test_filtered_product_object_cannot_claim_foreign_import_placeholder(): void {
+		$run_a           = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+		$run_b           = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+		$expires_at      = time() + DAY_IN_SECONDS;
+		$importer_a      = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $run_a,
+				'import_run_expires_at' => $expires_at,
+			)
+		);
+		$placeholder_id  = $importer_a->parse_relative_field( 'id:987654338' );
+		$importer_b      = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $run_b,
+				'import_run_expires_at' => $expires_at,
+				'prevent_timeouts'      => false,
+			)
+		);
+		$parsed_data     = new ReflectionProperty( WC_Product_Importer::class, 'parsed_data' );
+		$replace_product = static function () use ( $placeholder_id ) {
+			return wc_get_product( $placeholder_id );
+		};
+
+		$parsed_data->setAccessible( true );
+		$parsed_data->setValue(
+			$importer_b,
+			array(
+				array(
+					'name' => 'Filtered product object',
+					'type' => ProductType::SIMPLE,
+				),
+			)
+		);
+		add_filter( 'woocommerce_product_import_get_product_object', $replace_product );
+
+		try {
+			$result      = $importer_b->import();
+			$placeholder = wc_get_product( $placeholder_id );
+
+			$this->assertCount( 1, $result['failed'] );
+			$this->assertEmpty( $result['imported'] );
+			$this->assertSame( 'importing', $placeholder->get_status() );
+			$this->assertSame( $run_a, $placeholder->get_meta( '_wc_product_csv_import_run_id' ) );
+		} finally {
+			remove_filter( 'woocommerce_product_import_get_product_object', $replace_product );
+			WC_Helper_Product::delete_product( $placeholder_id );
+		}
+	}
+
+	/**
+	 * @testdox Pre-insert filters cannot replace a row with another import's placeholder.
+	 */
+	public function test_pre_insert_filter_cannot_claim_foreign_import_placeholder(): void {
+		$run_a           = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+		$run_b           = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+		$expires_at      = time() + DAY_IN_SECONDS;
+		$importer_a      = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $run_a,
+				'import_run_expires_at' => $expires_at,
+			)
+		);
+		$placeholder_id  = $importer_a->parse_relative_field( 'id:987654341' );
+		$importer_b      = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $run_b,
+				'import_run_expires_at' => $expires_at,
+				'prevent_timeouts'      => false,
+			)
+		);
+		$parsed_data     = new ReflectionProperty( WC_Product_Importer::class, 'parsed_data' );
+		$replace_product = static function () use ( $placeholder_id ) {
+			return wc_get_product( $placeholder_id );
+		};
+
+		$parsed_data->setAccessible( true );
+		$parsed_data->setValue(
+			$importer_b,
+			array(
+				array(
+					'name' => 'Pre-insert filtered product',
+					'type' => ProductType::SIMPLE,
+				),
+			)
+		);
+		add_filter( 'woocommerce_product_import_pre_insert_product_object', $replace_product );
+
+		try {
+			$result      = $importer_b->import();
+			$placeholder = wc_get_product( $placeholder_id );
+
+			$this->assertCount( 1, $result['failed'] );
+			$this->assertEmpty( $result['imported'] );
+			$this->assertSame( 'importing', $placeholder->get_status() );
+			$this->assertSame( $run_a, $placeholder->get_meta( '_wc_product_csv_import_run_id' ) );
+		} finally {
+			remove_filter( 'woocommerce_product_import_pre_insert_product_object', $replace_product );
+			WC_Helper_Product::delete_product( $placeholder_id );
+		}
+	}
+
+	/**
+	 * @testdox A later import should safely adopt placeholders from an expired run.
+	 */
+	public function test_expired_placeholder_ownership_can_be_adopted(): void {
+		$expired_run_id          = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+		$current_run_id          = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+		$original_id             = 987654336;
+		$sku                     = 'EXPIRED-IMPORT-RUN-' . wp_generate_uuid4();
+		$expired                 = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $expired_run_id,
+				'import_run_expires_at' => time() + DAY_IN_SECONDS,
+			)
+		);
+		$current_expiration      = time() + DAY_IN_SECONDS;
+		$current                 = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $current_run_id,
+				'import_run_expires_at' => $current_expiration,
+			)
+		);
+		$original_placeholder_id = $expired->parse_relative_field( 'id:' . $original_id );
+		$sku_placeholder_id      = $expired->parse_relative_field( $sku );
+		update_post_meta( $original_placeholder_id, '_wc_product_csv_import_run_expires_at', time() - 1 );
+		update_post_meta( $sku_placeholder_id, '_wc_product_csv_import_run_expires_at', time() - 1 );
+
+		$this->assertSame( $original_placeholder_id, $current->parse_relative_field( 'id:' . $original_id ) );
+		$this->assertSame( $sku_placeholder_id, $current->parse_relative_field( $sku ) );
+		$this->assertSame( $current_run_id, get_post_meta( $original_placeholder_id, '_wc_product_csv_import_run_id', true ) );
+		$this->assertSame( $current_run_id, get_post_meta( $sku_placeholder_id, '_wc_product_csv_import_run_id', true ) );
+		$this->assertSame( $current_expiration, absint( get_post_meta( $original_placeholder_id, '_wc_product_csv_import_run_expires_at', true ) ) );
+	}
+
+	/**
+	 * @testdox A later import should reuse a completed mapping left by an expired run.
+	 */
+	public function test_expired_completed_mapping_can_be_adopted(): void {
+		$expired_run_id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+		$current_run_id = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+		$original_id    = 987654343;
+		$expired        = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $expired_run_id,
+				'import_run_expires_at' => time() + DAY_IN_SECONDS,
+			)
+		);
+		$product_id     = $expired->parse_relative_field( 'id:' . $original_id );
+		wp_update_post(
+			array(
+				'ID'          => $product_id,
+				'post_status' => 'publish',
+			)
+		);
+		update_post_meta( $product_id, '_wc_product_csv_import_run_expires_at', time() - 1 );
+		$current_expiration = time() + DAY_IN_SECONDS;
+		$current            = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $current_run_id,
+				'import_run_expires_at' => $current_expiration,
+			)
+		);
+
+		try {
+			$this->assertSame( $product_id, $current->parse_relative_field( 'id:' . $original_id ) );
+			$this->assertSame( $current_run_id, get_post_meta( $product_id, '_wc_product_csv_import_run_id', true ) );
+			$this->assertSame( $current_expiration, absint( get_post_meta( $product_id, '_wc_product_csv_import_run_expires_at', true ) ) );
+		} finally {
+			WC_Helper_Product::delete_product( $product_id );
+		}
+	}
+
+	/**
+	 * @testdox Importers should not adopt or release a placeholder with ambiguous ownership.
+	 */
+	public function test_duplicate_placeholder_ownership_is_preserved(): void {
+		$expired_run_id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+		$current_run_id = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+		$foreign_run_id = 'cccccccccccccccccccccccccccccccccccccccc';
+		$original_id    = 987654342;
+		$expired        = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $expired_run_id,
+				'import_run_expires_at' => time() + DAY_IN_SECONDS,
+			)
+		);
+		$placeholder_id = $expired->parse_relative_field( 'id:' . $original_id );
+		update_post_meta( $placeholder_id, '_wc_product_csv_import_run_expires_at', time() - ( 2 * HOUR_IN_SECONDS ) );
+		add_post_meta( $placeholder_id, '_wc_product_csv_import_run_id', $foreign_run_id );
+		$current = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $current_run_id,
+				'import_run_expires_at' => time() + DAY_IN_SECONDS,
+			)
+		);
+
+		$current_placeholder_id  = $current->parse_relative_field( 'id:' . $original_id );
+		$unscoped                = new WC_Product_CSV_Importer( __DIR__ . '/sample.csv' );
+		$unscoped_placeholder_id = $unscoped->parse_relative_field( 'id:' . $original_id );
+
+		try {
+			$this->assertNotSame( $placeholder_id, $current_placeholder_id );
+			$this->assertNotSame( $placeholder_id, $unscoped_placeholder_id );
+			$this->assertSame( array( $expired_run_id, $foreign_run_id ), get_post_meta( $placeholder_id, '_wc_product_csv_import_run_id', false ) );
+		} finally {
+			foreach ( array_unique( array( $placeholder_id, $current_placeholder_id, $unscoped_placeholder_id ) ) as $product_id ) {
+				WC_Helper_Product::delete_product( $product_id );
+			}
+		}
+	}
+
+	/**
+	 * @testdox Programmatic imports can reuse abandoned placeholders after the expiration grace period.
+	 */
+	public function test_unscoped_importer_releases_expired_placeholder_ownership(): void {
+		$expires_at              = time() + DAY_IN_SECONDS;
+		$scoped                  = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+				'import_run_expires_at' => $expires_at,
+			)
+		);
+		$original_id             = 987654339;
+		$sku                     = 'UNSCOPED-EXPIRED-' . wp_generate_uuid4();
+		$original_placeholder_id = $scoped->parse_relative_field( 'id:' . $original_id );
+		$sku_placeholder_id      = $scoped->parse_relative_field( $sku );
+		$expired_at              = time() - ( 2 * HOUR_IN_SECONDS );
+		update_post_meta( $original_placeholder_id, '_wc_product_csv_import_run_expires_at', $expired_at );
+		update_post_meta( $sku_placeholder_id, '_wc_product_csv_import_run_expires_at', $expired_at );
+		$unscoped = new WC_Product_CSV_Importer( __DIR__ . '/sample.csv' );
+
+		$this->assertSame( $original_placeholder_id, $unscoped->parse_relative_field( 'id:' . $original_id ) );
+		$this->assertSame( $sku_placeholder_id, $unscoped->parse_relative_field( $sku ) );
+		$this->assertSame( '', get_post_meta( $original_placeholder_id, '_wc_product_csv_import_run_id', true ) );
+		$this->assertSame( '', get_post_meta( $sku_placeholder_id, '_wc_product_csv_import_run_id', true ) );
+		$this->assertSame( '', get_post_meta( $original_placeholder_id, '_wc_product_csv_import_run_expires_at', true ) );
+		$this->assertSame( '', get_post_meta( $sku_placeholder_id, '_wc_product_csv_import_run_expires_at', true ) );
+	}
+
+	/**
+	 * @testdox Imported metadata should not replace a placeholder's import owner.
+	 */
+	public function test_import_run_meta_is_reserved(): void {
+		$run_id         = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+		$foreign_run_id = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+		$expires_at     = time() + DAY_IN_SECONDS;
+		$importer       = new WC_Product_CSV_Importer(
+			__DIR__ . '/sample.csv',
+			array(
+				'import_run_id'         => $run_id,
+				'import_run_expires_at' => $expires_at,
+			)
+		);
+		$placeholder_id = $importer->parse_relative_field( 'id:987654335' );
+		$product        = wc_get_product( $placeholder_id );
+		$method         = new ReflectionMethod( $importer, 'set_meta_data' );
+		$method->setAccessible( true );
+		$args = array(
+			&$product,
+			array(
+				'meta_data' => array(
+					array(
+						'key'   => '_wc_product_csv_import_run_id',
+						'value' => $foreign_run_id,
+					),
+					array(
+						'key'   => '_wc_product_csv_import_run_expires_at',
+						'value' => 1,
+					),
+				),
+			),
+		);
+
+		$method->invokeArgs( $importer, $args );
+		$product->save();
+
+		$this->assertSame( $run_id, get_post_meta( $placeholder_id, '_wc_product_csv_import_run_id', true ) );
+		$this->assertSame( $expires_at, absint( get_post_meta( $placeholder_id, '_wc_product_csv_import_run_expires_at', true ) ) );
 	}
 
 	/**
