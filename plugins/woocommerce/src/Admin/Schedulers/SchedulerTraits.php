@@ -21,7 +21,7 @@ trait SchedulerTraits {
 	/**
 	 * Queue instance.
 	 *
-	 * @var WC_Queue_Interface
+	 * @var \WC_Queue_Interface|null
 	 */
 	protected static $queue = null;
 
@@ -38,7 +38,7 @@ trait SchedulerTraits {
 	/**
 	 * Get queue instance.
 	 *
-	 * @return WC_Queue_Interface
+	 * @return \WC_Queue_Interface
 	 */
 	public static function queue() {
 		if ( is_null( self::$queue ) ) {
@@ -51,7 +51,7 @@ trait SchedulerTraits {
 	/**
 	 * Set queue instance.
 	 *
-	 * @param WC_Queue_Interface $queue Queue instance.
+	 * @param \WC_Queue_Interface|null $queue Queue instance, or null to reset it.
 	 */
 	public static function set_queue( $queue ) {
 		self::$queue = $queue;
@@ -254,7 +254,7 @@ trait SchedulerTraits {
 				$next_action_time->getTimestamp() + 5,
 				$action_hook,
 				$args,
-				static::$group
+				(string) static::$group
 			);
 		} else {
 			call_user_func_array( array( static::class, $action_name ), $args );
@@ -305,7 +305,7 @@ trait SchedulerTraits {
 			return;
 		}
 
-		self::queue()->schedule_single( time() + 5, $action_hook, $args, static::$group );
+		self::queue()->schedule_single( time() + 5, $action_hook, $args, (string) static::$group );
 	}
 
 	/**
@@ -359,7 +359,8 @@ trait SchedulerTraits {
 		} else {
 			$actions = static::get_actions();
 			foreach ( $actions as $action ) {
-				self::queue()->cancel_all( $action, null, static::$group );
+				// @phpstan-ignore-next-line argument.type (Null intentionally matches every action argument.)
+				self::queue()->cancel_all( $action, null, (string) static::$group );
 			}
 		}
 	}
