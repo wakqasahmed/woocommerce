@@ -466,7 +466,7 @@ class ReportExporter {
 				header( 'Allow: GET' );
 			}
 			status_header( 405 );
-			return;
+			wp_die( '', '', array( 'response' => 405 ) );
 		}
 
 		if ( ! current_user_can( 'view_woocommerce_reports' ) || empty( $_GET['filename'] ) || ! is_string( $_GET['filename'] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Report downloads are capability-gated.
@@ -478,7 +478,7 @@ class ReportExporter {
 		$filename = $exporter->get_filename();
 		if ( ! self::send_export_file( $exporter, $filename ) ) {
 			status_header( 404 );
-			return;
+			wp_die( '', '', array( 'response' => 404 ) );
 		}
 
 		if ( ! self::schedule_export_cleanup( $filename ) && ! self::delete_export_file( $filename ) ) {

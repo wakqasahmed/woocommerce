@@ -100,7 +100,7 @@ class ReportExporterTest extends WC_Unit_Test_Case {
 		$this->set_download_request( $request_method );
 		$status = $this->capture_status();
 
-		ReportExporter::download_export_file();
+		$this->assert_download_request_terminates();
 
 		$this->assertSame( 405, $status(), 'A non-GET download should return method not allowed.' );
 		$this->assertFileExists( $paths['body'], 'A rejected request should retain the export body.' );
@@ -121,7 +121,7 @@ class ReportExporterTest extends WC_Unit_Test_Case {
 		$this->set_download_request();
 		$status = $this->capture_status();
 
-		ReportExporter::download_export_file();
+		$this->assert_download_request_terminates();
 
 		$missing_part = 'body' === $existing_part ? 'headers' : 'body';
 		$this->assertSame( 404, $status(), 'An incomplete export should return not found.' );
@@ -352,6 +352,23 @@ class ReportExporterTest extends WC_Unit_Test_Case {
 		wp_set_current_user( self::factory()->user->create( array( 'role' => 'administrator' ) ) );
 		$_GET['action']            = ReportExporter::DOWNLOAD_EXPORT_ACTION;
 		$_SERVER['REQUEST_METHOD'] = $request_method;
+	}
+
+	/**
+	 * Assert that the download handler terminates the request.
+	 *
+	 * @return void
+	 */
+	private function assert_download_request_terminates(): void {
+		$request_terminated = false;
+
+		try {
+			ReportExporter::download_export_file();
+		} catch ( \WPDieException $exception ) {
+			$request_terminated = true;
+		}
+
+		$this->assertTrue( $request_terminated, 'A matched download error should terminate the request.' );
 	}
 
 	/**
