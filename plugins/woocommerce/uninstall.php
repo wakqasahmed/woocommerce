@@ -26,6 +26,7 @@ wp_clear_scheduled_hook( 'woocommerce_cleanup_rate_limits' );
 wp_clear_scheduled_hook( 'wc_admin_daily' );
 wp_clear_scheduled_hook( 'generate_category_lookup_table' );
 wp_clear_scheduled_hook( 'wc_admin_unsnooze_admin_notes' );
+wp_clear_scheduled_hook( 'woocommerce_admin_report_export_cleanup' );
 
 if ( class_exists( ActionScheduler::class ) && ActionScheduler::is_initialized() && function_exists( 'as_unschedule_all_actions' ) ) {
 	as_unschedule_all_actions( 'woocommerce_scheduled_sales' );
@@ -39,6 +40,7 @@ if ( class_exists( ActionScheduler::class ) && ActionScheduler::is_initialized()
 	as_unschedule_all_actions( 'wc_admin_daily' );
 	as_unschedule_all_actions( 'generate_category_lookup_table' );
 	as_unschedule_all_actions( 'wc_admin_unsnooze_admin_notes' );
+	as_unschedule_all_actions( 'woocommerce_admin_report_export_cleanup' );
 }
 
 /*

@@ -233,45 +233,27 @@ class ReportExporterTest extends WC_Unit_Test_Case {
 	}
 
 	/**
-	 * @testdox Should clean up the original directory after the uploads directory changes.
+	 * @testdox Should cancel an invalid recurring cleanup job.
 	 */
-	public function test_cleanup_export_uses_scheduled_directory(): void {
-		$paths         = $this->create_export_files();
-		$filename      = basename( $paths['body'] );
-		$cleanup_args  = $this->get_cleanup_action_args( $filename );
-		$upload_filter = static function ( $uploads ) {
-			$uploads['basedir'] = trailingslashit( $uploads['basedir'] ) . 'moved';
-			return $uploads;
-		};
-		touch( $paths['body'], time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
-		touch( $paths['headers'], time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
-		add_filter( 'upload_dir', $upload_filter );
-
-		try {
-			ReportExporter::cleanup_export( ...$cleanup_args );
-
-			$this->assertFileDoesNotExist( $paths['body'], 'Cleanup should remove the body from its original directory.' );
-			$this->assertFileDoesNotExist( $paths['headers'], 'Cleanup should remove the headers from their original directory.' );
-		} finally {
-			remove_filter( 'upload_dir', $upload_filter );
-		}
-	}
-
-	/**
-	 * @testdox Should reject a cleanup job whose scheduled directory was changed.
-	 */
-	public function test_cleanup_export_rejects_tampered_directory(): void {
-		$paths        = $this->create_export_files();
-		$filename     = basename( $paths['body'] );
-		$cleanup_args = $this->get_cleanup_action_args( $filename );
-		touch( $paths['body'], time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
-		touch( $paths['headers'], time() - WEEK_IN_SECONDS - 10 ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_touch
-		$cleanup_args[1] .= 'changed/woocommerce_uploads/reports/';
+	public function test_cleanup_export_cancels_invalid_job(): void {
+		$cleanup_hook = ReportExporter::get_action( 'cleanup_export' );
+		$cleanup_args = array( '../invalid.csv' );
+		$this->assertIsString( $cleanup_hook );
+		$this->assertTrue( wp_schedule_event( time() + WEEK_IN_SECONDS, 'daily', $cleanup_hook, $cleanup_args ) );
+		as_schedule_single_action( time() + WEEK_IN_SECONDS, $cleanup_hook, $cleanup_args, 'wc-admin-report-cleanup' );
 
 		ReportExporter::cleanup_export( ...$cleanup_args );
 
-		$this->assertFileExists( $paths['body'], 'A cleanup job with a changed directory should not delete the body.' );
-		$this->assertFileExists( $paths['headers'], 'A cleanup job with a changed directory should not delete the headers.' );
+		$this->assertFalse( wp_next_scheduled( $cleanup_hook, $cleanup_args ), 'The invalid WP-Cron job should be removed.' );
+		$cleanup_actions = as_get_scheduled_actions(
+			array(
+				'hook'     => $cleanup_hook,
+				'args'     => $cleanup_args,
+				'status'   => \ActionScheduler_Store::STATUS_PENDING,
+				'per_page' => 1,
+			)
+		);
+		$this->assertCount( 0, $cleanup_actions, 'The invalid Action Scheduler job should be removed.' );
 	}
 
 	/**
@@ -338,19 +320,13 @@ class ReportExporterTest extends WC_Unit_Test_Case {
 	}
 
 	/**
-	 * Build the validated arguments used by an export cleanup job.
+	 * Build the arguments used by an export cleanup job.
 	 *
 	 * @param string $filename Export filename.
-	 * @return array{string, string, string} Cleanup arguments.
+	 * @return array{string} Cleanup arguments.
 	 */
 	private function get_cleanup_action_args( string $filename ): array {
-		$method = new \ReflectionMethod( ReportExporter::class, 'get_export_cleanup_args' );
-		$method->setAccessible( true );
-		$args = $method->invoke( null, $filename );
-
-		$this->assertIsArray( $args );
-
-		return $args;
+		return array( $filename );
 	}
 
 	/**

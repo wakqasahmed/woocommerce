@@ -149,12 +149,9 @@ class WC_Admin_Tests_API_Reports_Export extends WC_REST_Unit_Test_Case {
 
 		// Run the pending export jobs.
 		WC_Helper_Queue::run_all_pending( 'wc-admin-data' );
-		$cleanup_hook        = ReportExporter::get_action( 'cleanup_export' );
-		$cleanup_args_method = new ReflectionMethod( ReportExporter::class, 'get_export_cleanup_args' );
-		$cleanup_args_method->setAccessible( true );
-		$cleanup_args = $cleanup_args_method->invoke( null, 'wc-taxes-report-export-' . $export['export_id'] . '.csv' ); // phpcs:ignore Generic.Formatting.MultipleStatementAlignment.NotSameWarning -- Keeping the reflection setup readable.
+		$cleanup_hook = ReportExporter::get_action( 'cleanup_export' );
+		$cleanup_args = array( 'wc-taxes-report-export-' . $export['export_id'] . '.csv' );
 		$this->assertIsString( $cleanup_hook );
-		$this->assertIsArray( $cleanup_args );
 		$cleanup_event = wp_get_scheduled_event( $cleanup_hook, $cleanup_args );
 		$this->assertNotFalse( $cleanup_event );
 		$this->assertSame( 'daily', $cleanup_event->schedule );
